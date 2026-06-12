@@ -1,1 +1,503 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Eyser Lojistik</title>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #f3f4f6; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; } }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
 
+    const CURRENCIES = ["TL","USD","EUR"];
+    const ROLLER = ["Taşıyıcı","Forwarder"];
+    const OP_DURUMLAR = ["Aktif","Tamamlandı","İptal"];
+    const TAHSILAT_DURUMLAR = ["Bekliyor","Ödendi","Gecikti","Kısmi"];
+    const TASIMACILAR = ["Özmal","Alt Nakliyeci"];
+
+    function uid() { return Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
+    function today() { return new Date().toISOString().split("T")[0]; }
+    function fmt(v, cur) {
+      if (!v || Number(v)===0) return "—";
+      const s = {TL:"₺",USD:"$",EUR:"€"}[cur]||"";
+      return s+Number(v).toLocaleString("tr-TR",{minimumFractionDigits:2});
+    }
+
+    function emptyOp() {
+      return {
+        id: uid(), refKodu:"", tarih:today(), opDurum:"Aktif",
+        musteriAd:"", yukAlici:"", satisci:"", guzergah:"",
+        aracPlaka:"", surucu:"", yukTanimi:"", notlar:"",
+        rol:"Taşıyıcı", tasimaci:"Özmal", altNakliyeciAd:"",
+        musteriNavlun:"", musteriNavlunDoviz:"EUR",
+        altNavlun:"", altNavlunDoviz:"EUR",
+        tahsilatDurum:"Bekliyor", tahsilatVade:"", tahsilatTarih:"",
+        odemeDurum:"Bekliyor", odemeVade:"", odemeTarih:"",
+        maliyetTutar:"", maliyetDoviz:"TL",
+        olusturmaTarih: new Date().toISOString(),
+      };
+    }
+
+    // Firebase CDN
+    const FIREBASE_CONFIG = {
+      apiKey: "AIzaSyAqIh2zlolD2g4usd3Iy8gZkvhIwS9NN8Y",
+      authDomain: "eyser-lojistik.firebaseapp.com",
+      projectId: "eyser-lojistik",
+      storageBucket: "eyser-lojistik.firebasestorage.app",
+      messagingSenderId: "932277548852",
+      appId: "1:932277548852:web:4a2c0d76ed8e1a0f08d761"
+    };
+
+    // Firestore REST API (Firebase SDK gerektirmez)
+    const PROJECT = "eyser-lojistik";
+    const FS_URL = `https://firestore.googleapis.com/v1/projects/${PROJECT}/databases/(default)/documents`;
+
+    function toFS(obj) {
+      const fields = {};
+      for (const [k,v] of Object.entries(obj)) {
+        if (v === null || v === undefined) fields[k] = {nullValue:null};
+        else if (typeof v === "boolean") fields[k] = {booleanValue:v};
+        else if (typeof v === "number") fields[k] = {doubleValue:v};
+        else if (Array.isArray(v)) fields[k] = {arrayValue:{values:v.map(i=>({mapValue:{fields:toFS(i)}}))}};
+        else fields[k] = {stringValue:String(v)};
+      }
+      return fields;
+    }
+
+    function fromFS(doc) {
+      const obj = {id: doc.name.split("/").pop()};
+      for (const [k,v] of Object.entries(doc.fields||{})) {
+        if (v.stringValue !== undefined) obj[k] = v.stringValue;
+        else if (v.doubleValue !== undefined) obj[k] = v.doubleValue;
+        else if (v.integerValue !== undefined) obj[k] = Number(v.integerValue);
+        else if (v.booleanValue !== undefined) obj[k] = v.booleanValue;
+        else if (v.nullValue !== undefined) obj[k] = null;
+        else if (v.arrayValue) obj[k] = (v.arrayValue.values||[]).map(i=>fromFS({name:"_",fields:i.mapValue?.fields||{}}));
+        else obj[k] = null;
+      }
+      return obj;
+    }
+
+    async function fsGetAll() {
+      const r = await fetch(`${FS_URL}/ops`);
+      const d = await r.json();
+      return (d.documents||[]).map(fromFS);
+    }
+
+    async function fsSave(op) {
+      const {id, ...rest} = op;
+      await fetch(`${FS_URL}/ops/${id}?updateMask.fieldPaths=${Object.keys(rest).join("&updateMask.fieldPaths=")}`, {
+        method:"PATCH",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({fields:toFS(rest)})
+      });
+    }
+
+    async function fsDelete(id) {
+      await fetch(`${FS_URL}/ops/${id}`, {method:"DELETE"});
+    }
+
+    // ── INPUT & SELECT BILEŞENLERI ──
+    function Field({label, children, span=1}) {
+      return (
+        <div style={{gridColumn:`span ${span}`}}>
+          <label style={{display:"block",fontSize:12,fontWeight:700,color:"#6b7280",marginBottom:5,textTransform:"uppercase",letterSpacing:0.5}}>{label}</label>
+          {children}
+        </div>
+      );
+    }
+
+    const inp = {width:"100%",padding:"9px 12px",border:"1px solid #d1d5db",borderRadius:7,fontSize:14,outline:"none",background:"#fff"};
+    const sel = {...inp};
+
+    // ── ANA UYGULAMA ──
+    function App() {
+      const [ops, setOps] = useState([]);
+      const [loading, setLoading] = useState(true);
+      const [page, setPage] = useState("list");
+      const [editOp, setEditOp] = useState(null);
+      const [toast, setToast] = useState(null);
+      const [confirm, setConfirm] = useState(null);
+      const [search, setSearch] = useState("");
+      const [formTab, setFormTab] = useState("bilgi");
+
+      async function refresh() {
+        try {
+          const data = await fsGetAll();
+          setOps(data.sort((a,b)=>new Date(b.tarih||0)-new Date(a.tarih||0)));
+        } catch(e) {
+          showToast("Veri yükleme hatası","error");
+        }
+        setLoading(false);
+      }
+
+      useEffect(() => {
+        refresh();
+        const t = setInterval(refresh, 10000);
+        return () => clearInterval(t);
+      }, []);
+
+      function showToast(msg, type="success") {
+        setToast({msg,type});
+        setTimeout(()=>setToast(null),3000);
+      }
+
+      async function saveOp() {
+        if (!editOp.refKodu.trim()) { showToast("Ref kodu zorunlu!","error"); return; }
+        try {
+          await fsSave(editOp);
+          await refresh();
+          showToast("Kaydedildi ✓");
+          setPage("list");
+          setEditOp(null);
+        } catch(e) {
+          showToast("Kaydetme hatası","error");
+        }
+      }
+
+      function askDelete(id) {
+        const op = ops.find(o=>o.id===id);
+        setConfirm({id, ref: op?.refKodu});
+      }
+
+      async function doDelete() {
+        try {
+          await fsDelete(confirm.id);
+          await refresh();
+          showToast("Silindi");
+          setConfirm(null);
+          setPage("list");
+        } catch(e) {
+          showToast("Silme hatası","error");
+        }
+      }
+
+      function set(f,v) { setEditOp(p=>({...p,[f]:v})); }
+
+      const filtered = ops.filter(o => {
+        const s = search.toLowerCase();
+        return !s || [o.refKodu,o.musteriAd,o.satisci,o.guzergah].some(v=>v?.toLowerCase().includes(s));
+      });
+
+      if (loading) return (
+        <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",minHeight:"100vh",background:"#f3f4f6"}}>
+          <div style={{width:40,height:40,border:"3px solid #e5e7eb",borderTop:"3px solid #f59e0b",borderRadius:"50%",animation:"spin 0.8s linear infinite"}}/>
+          <p style={{color:"#9ca3af",marginTop:16,fontFamily:"system-ui"}}>Firebase bağlanıyor...</p>
+        </div>
+      );
+
+      return (
+        <div style={{minHeight:"100vh",background:"#f3f4f6",fontFamily:"system-ui,sans-serif"}}>
+          {/* TOPBAR */}
+          <div style={{background:"#1e293b",padding:"0 24px",display:"flex",alignItems:"center",gap:16,height:56}}>
+            <div style={{display:"flex",alignItems:"center",gap:10}}>
+              <div style={{width:32,height:32,background:"#f59e0b",borderRadius:8,display:"flex",alignItems:"center",justifyContent:"center",fontWeight:900,color:"white",fontSize:16}}>E</div>
+              <div>
+                <div style={{color:"white",fontWeight:800,fontSize:15,lineHeight:1}}>EYSER</div>
+                <div style={{color:"#f59e0b",fontSize:10,fontWeight:700,letterSpacing:1}}>LOJİSTİK</div>
+              </div>
+            </div>
+            <div style={{flex:1}}/>
+            <button onClick={()=>{setEditOp(emptyOp());setFormTab("bilgi");setPage("form");}} style={{padding:"8px 16px",background:"#f59e0b",color:"#1e293b",border:"none",borderRadius:7,fontWeight:700,cursor:"pointer",fontSize:13}}>
+              ＋ Yeni Operasyon
+            </button>
+          </div>
+
+          <div style={{maxWidth:1300,margin:"0 auto",padding:"24px 20px"}}>
+
+            {/* LİSTE */}
+            {page==="list" && (
+              <div>
+                <div style={{display:"flex",gap:10,marginBottom:18,flexWrap:"wrap"}}>
+                  <input style={{...inp,flex:"1 1 200px",minWidth:160}} placeholder="🔍 Ref, müşteri, satışçı, güzergah..." value={search} onChange={e=>setSearch(e.target.value)}/>
+                  <button onClick={refresh} style={{padding:"9px 16px",background:"#e2e8f0",border:"none",borderRadius:7,cursor:"pointer",fontWeight:600}}>🔄</button>
+                </div>
+                <div style={{background:"white",borderRadius:12,boxShadow:"0 1px 4px rgba(0,0,0,0.07)",overflow:"auto"}}>
+                  <table style={{width:"100%",borderCollapse:"collapse"}}>
+                    <thead>
+                      <tr style={{background:"#f8fafc",borderBottom:"1px solid #e2e8f0"}}>
+                        {["Ref","Tarih","Müşteri","Satışçı","Rol","Aldım","Verdim","Kar","Tahsilat","Durum","İşlem"].map(h=>(
+                          <th key={h} style={{padding:"12px 14px",textAlign:"left",fontSize:12,fontWeight:700,color:"#6b7280",textTransform:"uppercase",letterSpacing:0.5,whiteSpace:"nowrap"}}>{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filtered.length===0 ? (
+                        <tr><td colSpan={11} style={{textAlign:"center",padding:40,color:"#9ca3af"}}>
+                          <div style={{fontSize:48}}>🚛</div>
+                          <div style={{marginTop:10,fontWeight:600}}>Operasyon bulunamadı</div>
+                          <button onClick={()=>{setEditOp(emptyOp());setFormTab("bilgi");setPage("form");}} style={{marginTop:14,padding:"10px 20px",background:"#3b82f6",color:"white",border:"none",borderRadius:7,cursor:"pointer",fontWeight:600}}>Yeni Ekle</button>
+                        </td></tr>
+                      ) : filtered.map(op => {
+                        const isF = op.rol==="Forwarder";
+                        const aldim = isF ? Number(op.musteriNavlun||0) : Number(op.maliyetTutar||0);
+                        const verdim = isF ? Number(op.altNavlun||0) : 0;
+                        const kar = isF ? aldim-verdim : null;
+                        const doviz = isF ? (op.musteriNavlunDoviz||"EUR") : (op.maliyetDoviz||"TL");
+                        return (
+                          <tr key={op.id} style={{borderBottom:"1px solid #f1f5f9",cursor:"pointer"}} onClick={()=>{setEditOp(op);setFormTab("bilgi");setPage("form");}}>
+                            <td style={{padding:"12px 14px",fontWeight:700,color:"#f59e0b",whiteSpace:"nowrap"}}>{op.refKodu}</td>
+                            <td style={{padding:"12px 14px",fontSize:13,whiteSpace:"nowrap"}}>{op.tarih}</td>
+                            <td style={{padding:"12px 14px",fontSize:13,maxWidth:120,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{op.musteriAd||"—"}</td>
+                            <td style={{padding:"12px 14px",fontSize:13,fontWeight:600,color:"#f59e0b"}}>{op.satisci||"—"}</td>
+                            <td style={{padding:"12px 14px"}}>
+                              <span style={{background:isF?"#dbeafe":"#f3e8ff",color:isF?"#1e40af":"#6b21a8",padding:"3px 8px",borderRadius:20,fontSize:11,fontWeight:700}}>{op.rol}</span>
+                            </td>
+                            <td style={{padding:"12px 14px",color:"#16a34a",fontWeight:600,fontSize:13}}>{fmt(aldim,doviz)}</td>
+                            <td style={{padding:"12px 14px",color:"#dc2626",fontSize:13}}>{isF?fmt(verdim,op.altNavlunDoviz||"EUR"):"—"}</td>
+                            <td style={{padding:"12px 14px",fontWeight:700,fontSize:13,color:kar===null?"#9ca3af":kar>=0?"#16a34a":"#dc2626"}}>
+                              {kar===null?"—":`${kar>=0?"+":""}${fmt(Math.abs(kar),doviz)}`}
+                            </td>
+                            <td style={{padding:"12px 14px"}}>
+                              <span style={{background:{Bekliyor:"#fef3c7",Ödendi:"#dcfce7",Gecikti:"#fee2e2",Kısmi:"#dbeafe"}[op.tahsilatDurum]||"#f3f4f6",color:{Bekliyor:"#92400e",Ödendi:"#166534",Gecikti:"#991b1b",Kısmi:"#1e40af"}[op.tahsilatDurum]||"#374151",padding:"3px 8px",borderRadius:20,fontSize:11,fontWeight:700}}>{op.tahsilatDurum||"—"}</span>
+                            </td>
+                            <td style={{padding:"12px 14px"}}>
+                              <span style={{background:{Aktif:"#dbeafe",Tamamlandı:"#dcfce7",İptal:"#f3f4f6"}[op.opDurum]||"#f3f4f6",color:{Aktif:"#1e40af",Tamamlandı:"#166534",İptal:"#6b7280"}[op.opDurum]||"#6b7280",padding:"3px 8px",borderRadius:20,fontSize:11,fontWeight:700}}>{op.opDurum}</span>
+                            </td>
+                            <td style={{padding:"12px 14px"}} onClick={e=>e.stopPropagation()}>
+                              <div style={{display:"flex",gap:4}}>
+                                <button onClick={()=>{setEditOp(op);setFormTab("bilgi");setPage("form");}} style={{padding:"4px 8px",background:"#3b82f6",color:"white",border:"none",borderRadius:4,cursor:"pointer",fontSize:12}}>✏️</button>
+                                <button onClick={()=>askDelete(op.id)} style={{padding:"4px 8px",background:"#ef4444",color:"white",border:"none",borderRadius:4,cursor:"pointer",fontSize:12}}>🗑️</button>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+                <div style={{fontSize:12,color:"#9ca3af",marginTop:10}}>{filtered.length} operasyon</div>
+              </div>
+            )}
+
+            {/* FORM */}
+            {page==="form" && editOp && (
+              <div style={{background:"white",borderRadius:12,padding:24,boxShadow:"0 1px 4px rgba(0,0,0,0.07)"}}>
+                <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:24}}>
+                  <button onClick={()=>{setPage("list");setEditOp(null);}} style={{padding:"8px 16px",background:"#f1f5f9",border:"none",borderRadius:7,cursor:"pointer",fontWeight:600}}>← Geri</button>
+                  <h2 style={{color:"#111827",fontWeight:800}}>{editOp.refKodu||"Yeni Operasyon"}</h2>
+                </div>
+
+                {/* TABS */}
+                <div style={{display:"flex",gap:4,marginBottom:24,borderBottom:"2px solid #e2e8f0",paddingBottom:0}}>
+                  {["bilgi","mali"].map(t=>(
+                    <button key={t} onClick={()=>setFormTab(t)} style={{padding:"10px 20px",background:"none",border:"none",borderBottom:`2px solid ${formTab===t?"#f59e0b":"transparent"}`,marginBottom:-2,cursor:"pointer",fontWeight:700,color:formTab===t?"#f59e0b":"#6b7280",fontSize:14}}>
+                      {t==="bilgi"?"📋 Temel Bilgiler":"💰 Mali Bilgiler"}
+                    </button>
+                  ))}
+                </div>
+
+                {/* TEMEL BİLGİLER */}
+                {formTab==="bilgi" && (
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
+                    <Field label="Referans Kodu *">
+                      <input style={inp} value={editOp.refKodu} onChange={e=>set("refKodu",e.target.value)} placeholder="EYS-2024-001"/>
+                    </Field>
+                    <Field label="Tarih">
+                      <input type="date" style={inp} value={editOp.tarih} onChange={e=>set("tarih",e.target.value)}/>
+                    </Field>
+                    <Field label="Operasyon Durumu">
+                      <select style={sel} value={editOp.opDurum} onChange={e=>set("opDurum",e.target.value)}>
+                        {OP_DURUMLAR.map(d=><option key={d}>{d}</option>)}
+                      </select>
+                    </Field>
+                    <Field label="Rol">
+                      <select style={sel} value={editOp.rol} onChange={e=>set("rol",e.target.value)}>
+                        {ROLLER.map(r=><option key={r}>{r}</option>)}
+                      </select>
+                    </Field>
+                    <Field label="İşi Alan Satışçı">
+                      <input style={{...inp,borderColor:"#f59e0b"}} value={editOp.satisci||""} onChange={e=>set("satisci",e.target.value)} placeholder="İbrahim, Ahmet..."/>
+                    </Field>
+                    <Field label="Müşteri Firma Adı">
+                      <input style={inp} value={editOp.musteriAd||""} onChange={e=>set("musteriAd",e.target.value)} placeholder="Dachser, XYZ A.Ş."/>
+                    </Field>
+                    <Field label="Güzergah" span={2}>
+                      <input style={inp} value={editOp.guzergah||""} onChange={e=>set("guzergah",e.target.value)} placeholder="İstanbul → Ankara"/>
+                    </Field>
+                    <Field label="Araç Plakası">
+                      <input style={inp} value={editOp.aracPlaka||""} onChange={e=>set("aracPlaka",e.target.value)} placeholder="34 ABC 123"/>
+                    </Field>
+                    <Field label="Sürücü">
+                      <input style={inp} value={editOp.surucu||""} onChange={e=>set("surucu",e.target.value)} placeholder="Ad Soyad"/>
+                    </Field>
+                    <Field label="Yük Tanımı" span={2}>
+                      <input style={inp} value={editOp.yukTanimi||""} onChange={e=>set("yukTanimi",e.target.value)} placeholder="Tekstil, makine..."/>
+                    </Field>
+                    <Field label="Notlar" span={2}>
+                      <textarea style={{...inp,height:70,resize:"vertical"}} value={editOp.notlar||""} onChange={e=>set("notlar",e.target.value)}/>
+                    </Field>
+                  </div>
+                )}
+
+                {/* MALİ BİLGİLER */}
+                {formTab==="mali" && (
+                  <div>
+                    {editOp.rol==="Forwarder" ? (
+                      <div>
+                        {/* Müşteri Navlunu */}
+                        <div style={{background:"#f0fdf4",border:"2px solid #86efac",borderRadius:12,padding:20,marginBottom:16}}>
+                          <div style={{fontSize:14,fontWeight:800,color:"#15803d",marginBottom:14}}>📥 Müşteriden Alacağım Navlun</div>
+                          <div style={{display:"grid",gridTemplateColumns:"1fr 100px",gap:12,marginBottom:14}}>
+                            <Field label="Navlun Tutarı">
+                              <input type="number" style={{...inp,fontSize:18,fontWeight:700,color:"#15803d"}} value={editOp.musteriNavlun||""} onChange={e=>set("musteriNavlun",e.target.value)} placeholder="2500"/>
+                            </Field>
+                            <Field label="Döviz">
+                              <select style={sel} value={editOp.musteriNavlunDoviz||"EUR"} onChange={e=>set("musteriNavlunDoviz",e.target.value)}>
+                                {CURRENCIES.map(c=><option key={c}>{c}</option>)}
+                              </select>
+                            </Field>
+                          </div>
+                          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:12}}>
+                            <Field label="Tahsilat Durumu">
+                              <select style={sel} value={editOp.tahsilatDurum||"Bekliyor"} onChange={e=>set("tahsilatDurum",e.target.value)}>
+                                {TAHSILAT_DURUMLAR.map(s=><option key={s}>{s}</option>)}
+                              </select>
+                            </Field>
+                            <Field label="Vade Tarihi">
+                              <input type="date" style={inp} value={editOp.tahsilatVade||""} onChange={e=>set("tahsilatVade",e.target.value)}/>
+                            </Field>
+                            <Field label="Tahsilat Tarihi">
+                              <input type="date" style={inp} value={editOp.tahsilatTarih||""} onChange={e=>set("tahsilatTarih",e.target.value)}/>
+                            </Field>
+                          </div>
+                        </div>
+
+                        {/* Alt Nakliye */}
+                        <div style={{background:"#fef2f2",border:"2px solid #fca5a5",borderRadius:12,padding:20,marginBottom:16}}>
+                          <div style={{fontSize:14,fontWeight:800,color:"#dc2626",marginBottom:14}}>📤 Alt Nakliyeye Vereceğim Ücret</div>
+                          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:14}}>
+                            <Field label="Alt Nakliyeci Adı" span={1}>
+                              <input style={inp} value={editOp.altNakliyeciAd||""} onChange={e=>set("altNakliyeciAd",e.target.value)} placeholder="Firma adı"/>
+                            </Field>
+                            <div/>
+                          </div>
+                          <div style={{display:"grid",gridTemplateColumns:"1fr 100px",gap:12,marginBottom:14}}>
+                            <Field label="Navlun Tutarı">
+                              <input type="number" style={{...inp,fontSize:18,fontWeight:700,color:"#dc2626"}} value={editOp.altNavlun||""} onChange={e=>set("altNavlun",e.target.value)} placeholder="2400"/>
+                            </Field>
+                            <Field label="Döviz">
+                              <select style={sel} value={editOp.altNavlunDoviz||"EUR"} onChange={e=>set("altNavlunDoviz",e.target.value)}>
+                                {CURRENCIES.map(c=><option key={c}>{c}</option>)}
+                              </select>
+                            </Field>
+                          </div>
+                          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:12}}>
+                            <Field label="Ödeme Durumu">
+                              <select style={sel} value={editOp.odemeDurum||"Bekliyor"} onChange={e=>set("odemeDurum",e.target.value)}>
+                                {TAHSILAT_DURUMLAR.map(s=><option key={s}>{s}</option>)}
+                              </select>
+                            </Field>
+                            <Field label="Vade Tarihi">
+                              <input type="date" style={inp} value={editOp.odemeVade||""} onChange={e=>set("odemeVade",e.target.value)}/>
+                            </Field>
+                            <Field label="Ödeme Tarihi">
+                              <input type="date" style={inp} value={editOp.odemeTarih||""} onChange={e=>set("odemeTarih",e.target.value)}/>
+                            </Field>
+                          </div>
+                        </div>
+
+                        {/* Kar Kutusu */}
+                        {(editOp.musteriNavlun||editOp.altNavlun) && (()=>{
+                          const aldim=Number(editOp.musteriNavlun||0);
+                          const verdim=Number(editOp.altNavlun||0);
+                          const kar=aldim-verdim;
+                          const pct=aldim>0?((kar/aldim)*100).toFixed(1):"0";
+                          const doviz=editOp.musteriNavlunDoviz||"EUR";
+                          return (
+                            <div style={{border:`2px solid ${kar>=0?"#22c55e":"#ef4444"}`,borderRadius:12,padding:20,background:kar>=0?"#f0fdf4":"#fef2f2"}}>
+                              <div style={{display:"flex",gap:0,borderRadius:8,overflow:"hidden",border:"1px solid #e5e7eb"}}>
+                                <div style={{flex:1,padding:"14px 16px",background:"white",textAlign:"center",borderRight:"1px solid #e5e7eb"}}>
+                                  <div style={{fontSize:11,color:"#9ca3af",fontWeight:700,marginBottom:6}}>MÜŞTERİDEN ALDIM</div>
+                                  <div style={{fontSize:20,fontWeight:900,color:"#15803d"}}>{fmt(aldim,doviz)}</div>
+                                </div>
+                                <div style={{display:"flex",alignItems:"center",padding:"0 10px",background:"#f9fafb",fontSize:18,color:"#9ca3af"}}>−</div>
+                                <div style={{flex:1,padding:"14px 16px",background:"white",textAlign:"center",borderLeft:"1px solid #e5e7eb",borderRight:"1px solid #e5e7eb"}}>
+                                  <div style={{fontSize:11,color:"#9ca3af",fontWeight:700,marginBottom:6}}>ALT NAKLİYEYE VERDİM</div>
+                                  <div style={{fontSize:20,fontWeight:900,color:"#dc2626"}}>{fmt(verdim,editOp.altNavlunDoviz||"EUR")}</div>
+                                </div>
+                                <div style={{display:"flex",alignItems:"center",padding:"0 10px",background:"#f9fafb",fontSize:18,color:"#9ca3af"}}>=</div>
+                                <div style={{flex:1,padding:"14px 16px",background:kar>=0?"#f0fdf4":"#fef2f2",textAlign:"center"}}>
+                                  <div style={{fontSize:11,color:"#9ca3af",fontWeight:700,marginBottom:6}}>NET KAR</div>
+                                  <div style={{fontSize:20,fontWeight:900,color:kar>=0?"#16a34a":"#dc2626"}}>{kar>=0?"+":""}{fmt(kar,doviz)}</div>
+                                  <div style={{fontSize:11,color:"#9ca3af",marginTop:4}}>{pct}%</div>
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        })()}
+                      </div>
+                    ) : (
+                      <div style={{background:"#f8fafc",border:"1px solid #e2e8f0",borderRadius:12,padding:20}}>
+                        <div style={{fontSize:14,fontWeight:800,color:"#374151",marginBottom:14}}>💸 Navlun / Ücret</div>
+                        <div style={{display:"grid",gridTemplateColumns:"1fr 100px",gap:12,marginBottom:16}}>
+                          <Field label="Tutar">
+                            <input type="number" style={{...inp,fontSize:18,fontWeight:700}} value={editOp.maliyetTutar||""} onChange={e=>set("maliyetTutar",e.target.value)} placeholder="0.00"/>
+                          </Field>
+                          <Field label="Döviz">
+                            <select style={sel} value={editOp.maliyetDoviz||"TL"} onChange={e=>set("maliyetDoviz",e.target.value)}>
+                              {CURRENCIES.map(c=><option key={c}>{c}</option>)}
+                            </select>
+                          </Field>
+                        </div>
+                        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:12}}>
+                          <Field label="Tahsilat Durumu">
+                            <select style={sel} value={editOp.tahsilatDurum||"Bekliyor"} onChange={e=>set("tahsilatDurum",e.target.value)}>
+                              {TAHSILAT_DURUMLAR.map(s=><option key={s}>{s}</option>)}
+                            </select>
+                          </Field>
+                          <Field label="Vade Tarihi">
+                            <input type="date" style={inp} value={editOp.tahsilatVade||""} onChange={e=>set("tahsilatVade",e.target.value)}/>
+                          </Field>
+                          <Field label="Tahsilat Tarihi">
+                            <input type="date" style={inp} value={editOp.tahsilatTarih||""} onChange={e=>set("tahsilatTarih",e.target.value)}/>
+                          </Field>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                <div style={{display:"flex",gap:12,marginTop:24,paddingTop:20,borderTop:"1px solid #e2e8f0"}}>
+                  <button onClick={saveOp} style={{padding:"12px 24px",background:"#3b82f6",color:"white",border:"none",borderRadius:8,cursor:"pointer",fontWeight:700,fontSize:15}}>💾 Kaydet</button>
+                  <button onClick={()=>{setPage("list");setEditOp(null);}} style={{padding:"12px 24px",background:"#f1f5f9",color:"#374151",border:"none",borderRadius:8,cursor:"pointer",fontWeight:600}}>İptal</button>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Toast */}
+          {toast && <div style={{position:"fixed",bottom:20,right:20,padding:"12px 20px",background:toast.type==="error"?"#ef4444":"#22c55e",color:"white",borderRadius:8,boxShadow:"0 4px 12px rgba(0,0,0,0.15)",animation:"fadeIn 0.2s ease",fontWeight:600}}>{toast.msg}</div>}
+
+          {/* Silme Onay */}
+          {confirm && (
+            <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.5)",zIndex:9999,display:"flex",alignItems:"center",justifyContent:"center"}}>
+              <div style={{background:"white",borderRadius:14,padding:28,maxWidth:380,width:"90%",textAlign:"center"}}>
+                <div style={{fontSize:36,marginBottom:12}}>🗑️</div>
+                <div style={{fontSize:16,fontWeight:800,marginBottom:8}}>Operasyonu Sil</div>
+                <div style={{color:"#6b7280",marginBottom:24}}><strong style={{color:"#f59e0b"}}>{confirm.ref}</strong> operasyonunu silmek istediğinizden emin misiniz?</div>
+                <div style={{display:"flex",gap:10}}>
+                  <button onClick={doDelete} style={{flex:1,padding:12,background:"#ef4444",color:"white",border:"none",borderRadius:8,cursor:"pointer",fontWeight:700}}>Evet, Sil</button>
+                  <button onClick={()=>setConfirm(null)} style={{flex:1,padding:12,background:"#f1f5f9",color:"#374151",border:"none",borderRadius:8,cursor:"pointer",fontWeight:600}}>İptal</button>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+  </script>
+</body>
+</html>

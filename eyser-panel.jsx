@@ -1,0 +1,1425 @@
+import { useState, useEffect, useRef, useCallback } from "react";
+
+// ═══════════════════════════════════════════════════════
+// STORAGE — evraklar op'a özgü ayrı key'lerde tutulur
+// Ana liste: "eyser_ops" → hafif meta objeler (base64 yok)
+// Dosyalar: "eyser_file_{opId}_{fileId}" → tek tek
+// ═══════════════════════════════════════════════════════
+const OPS_KEY = "eyser_ops";
+
+async function dbGet(key) {
+  try { const r = await window.storage.get(key); return r ? JSON.parse(r.value) : null; }
+  catch { return null; }
+}
+async function dbSet(key, val) {
+  try { await window.storage.set(key, JSON.stringify(val)); return true; }
+  catch (e) { console.error("storage set failed:", key, e); return false; }
+}
+async function dbDel(key) {
+  try { await window.storage.delete(key); } catch {}
+}
+
+async function loadOps() { return (await dbGet(OPS_KEY)) || []; }
+async function saveOps(ops) { await dbSet(OPS_KEY, ops); }
+
+// Dosyayı ayrı key'e kaydet, op objesine sadece {id,name,type,size,kategori,yuklenmeTarih} bırak
+async function saveFile(opId, fileObj) {
+  const key = `eyser_file_${opId}_${fileObj.id}`;
+  const ok = await dbSet(key, fileObj.data);
+  if (!ok) return false;
+  return true;
+}
+async function loadFileData(opId, fileId) {
+  return await dbGet(`eyser_file_${opId}_${fileId}`);
+}
+async function deleteFile(opId, fileId) {
+  await dbDel(`eyser_file_${opId}_${fileId}`);
+}
+// Op silinince tüm dosyalarını temizle (storage.list yoksa meta'dan gider)
+async function deleteOpFiles(op) {
+  const all = [...(op.evraklar || []), ...(op.faturalar || [])];
+  await Promise.allSettled(all.map(f => deleteFile(op.id, f.id)));
+}
+
+// ═══════════════════════════════════════════════════════
+// SABITLER
+// ═══════════════════════════════════════════════════════
+const CURRENCIES = ["TL", "USD", "EUR"];
+const TASIMACILAR = ["Özmal", "Alt Nakliyeci"];
+const ROLLER = ["Taşıyıcı", "Forwarder"];
+const ISVEREN_TIPLER = ["Forwarder", "İhracatçı", "İthalatçı", "Acente", "Diğer"];
+const OP_DURUMLAR = ["Aktif", "Tamamlandı", "İptal"];
+const EVRAK_KATEGORILER = ["CMR", "İrsaliye", "Sigorta", "Gümrük", "Konşimento", "Diğer"];
+const TAHSILAT_DURUMLAR = ["Bekliyor", "Ödendi", "Gecikti", "Kısmi"];
+
+const OP_DURUM_COLORS = { "Aktif": "#3b82f6", "Tamamlandı": "#22c55e", "İptal": "#6b7280" };
+const TAHSILAT_COLORS = { "Bekliyor": "#f59e0b", "Ödendi": "#22c55e", "Gecikti": "#ef4444", "Kısmi": "#3b82f6" };
+
+const MAX_FILE_MB = 4.5; // 5MB limit gözetilerek güvenli eşik
+
+function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
+function today() { return new Date().toISOString().split("T")[0]; }
+function fmt(amount, cur) {
+  if (amount === null || amount === undefined || amount === "") return "—";
+  if (Number(amount) === 0) return "—";
+  const sym = { TL: "₺", USD: "$", EUR: "€" }[cur] || "";
+  return sym + Number(amount).toLocaleString("tr-TR", { minimumFractionDigits: 2 });
+}
+function diffDays(dateStr) {
+  if (!dateStr) return null;
+  return Math.ceil((new Date(dateStr) - new Date(today())) / 86400000);
+}
+
+function emptyOp() {
+  return {
+    id: uid(),
+    refKodu: "",
+    tarih: today(),
+    opDurum: "Aktif",
+
+    // ── Genel ──
+    guzergah: "",
+    yukTanimi: "",
+    aracPlaka: "",
+    surucu: "",
+    notlar: "",
+
+    // ── Taraflar ──
+    musteriAd: "",        // Yükü veren müşteri / gönderici firma
+    yukAlici: "",         // Alıcı
+    satisci: "",          // Bizim şirketten işi alan satışçı (örn: İbrahim)
+
+    // ── Rol & Taşımacı ──
+    rol: "Taşıyıcı",      // Taşıyıcı | Forwarder
+    tasimaci: "Özmal",    // Özmal | Alt Nakliyeci
+    altNakliyeciAd: "",
+
+    // ── Forwarder: müşteri navlunu (bize ödeyecek) ──
+    musteriNavlun: "",
+    musteriNavlunDoviz: "EUR",
+    tahsilatDurum: "Bekliyor",
+    tahsilatVade: "",         // vade tarihi
+    tahsilatTarih: "",        // fiili tahsilat tarihi
+
+    // ── Alt nakliyeye ödeme ──
+    altNavlun: "",
+    altNavlunDoviz: "EUR",
+    odemeDurum: "Bekliyor",
+    odemeVade: "",
+    odemeTarih: "",
+
+    // ── Taşıyıcı / Özmal: sadece navlun ──
+    maliyetTutar: "",
+    maliyetDoviz: "TL",
+
+    // ── Eski uyumluluk alanları (migrate için) ──
+    satisTutar: "",
+    satisDoviz: "TL",
+    yukGonderici: "",
+
+    evraklar: [],
+    faturalar: [],
+    olusturmaTarih: new Date().toISOString(),
+    guncellemeTarih: new Date().toISOString(),
+  };
+}
+
+// ═══════════════════════════════════════════════════════
+// FILE READER HELPER
+// ═══════════════════════════════════════════════════════
+function readFileAsBase64(file) {
+  return new Promise((res, rej) => {
+    if (file.size > MAX_FILE_MB * 1024 * 1024) {
+      rej(new Error(`"${file.name}" çok büyük (max ${MAX_FILE_MB}MB)`));
+      return;
+    }
+    const r = new FileReader();
+    r.onload = () => res(r.result);
+    r.onerror = () => rej(new Error(`"${file.name}" okunamadı`));
+    r.readAsDataURL(file);
+  });
+}
+
+// ═══════════════════════════════════════════════════════
+// MAIN APP
+// ═══════════════════════════════════════════════════════
+export default function EyserPanel() {
+  const [ops, setOps] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [page, setPage] = useState("dashboard"); // dashboard | list | form | detail
+  const [selectedId, setSelectedId] = useState(null);
+  const [editOp, setEditOp] = useState(null);
+  const [formTab, setFormTab] = useState("bilgi");
+  const [detailTab, setDetailTab] = useState("bilgi");
+  const [search, setSearch] = useState("");
+  const [filterRol, setFilterRol] = useState("Tümü");
+  const [filterDurum, setFilterDurum] = useState("Tümü");
+  const [filterTahsilat, setFilterTahsilat] = useState("Tümü");
+  const [sortBy, setSortBy] = useState("tarih_desc");
+  const [toast, setToast] = useState(null);
+  const [confirmModal, setConfirmModal] = useState(null); // {opId, refKodu}
+  const toastTimer = useRef(null);
+
+  useEffect(() => { loadOps().then(d => { setOps(d); setLoading(false); }); }, []);
+
+  const showToast = useCallback((msg, type = "success") => {
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    setToast({ msg, type });
+    toastTimer.current = setTimeout(() => setToast(null), 3500);
+  }, []);
+
+  async function persist(newOps) {
+    setOps(newOps);
+    await saveOps(newOps);
+  }
+
+  function goNew() { setEditOp(emptyOp()); setFormTab("bilgi"); setPage("form"); }
+  function goEdit(op) { setEditOp(JSON.parse(JSON.stringify(op))); setFormTab("bilgi"); setPage("form"); }
+  function goDetail(op) { setSelectedId(op.id); setDetailTab("bilgi"); setPage("detail"); }
+  function goList() { setPage("list"); setSelectedId(null); }
+
+  async function saveOp() {
+    if (!editOp.refKodu.trim()) { showToast("Referans kodu zorunlu!", "error"); return; }
+    // Duplicate ref kodu kontrolü (aynı op değilse)
+    const dup = ops.find(o => o.id !== editOp.id && o.refKodu.trim().toLowerCase() === editOp.refKodu.trim().toLowerCase());
+    if (dup) { showToast(`"${editOp.refKodu}" ref kodu zaten kullanılıyor!`, "error"); return; }
+
+    const updated = { ...editOp, guncellemeTarih: new Date().toISOString() };
+    const exists = ops.find(o => o.id === updated.id);
+    const newOps = exists ? ops.map(o => o.id === updated.id ? updated : o) : [updated, ...ops];
+    await persist(newOps);
+    showToast("Operasyon kaydedildi ✓");
+    goList();
+  }
+
+  async function deleteOp(id) {
+    const op = ops.find(o => o.id === id);
+    if (!op) return;
+    setConfirmModal({ opId: id, refKodu: op.refKodu });
+  }
+
+  async function doDelete(id) {
+    const op = ops.find(o => o.id === id);
+    if (!op) return;
+    await deleteOpFiles(op);
+    await persist(ops.filter(o => o.id !== id));
+    setConfirmModal(null);
+    showToast("Operasyon silindi");
+    if (page === "detail") goList();
+  }
+
+  async function toggleOpDurum(id, newDurum) {
+    const newOps = ops.map(o => o.id === id ? { ...o, opDurum: newDurum, guncellemeTarih: new Date().toISOString() } : o);
+    await persist(newOps);
+    showToast(`Durum: ${newDurum}`);
+  }
+
+  // ── FILTERED + SORTED ──────────────────────────────
+  const filtered = ops.filter(o => {
+    const s = search.toLowerCase();
+    if (s && ![o.refKodu, o.yukGonderici, o.yukAlici, o.guzergah, o.altNakliyeciAd, o.aracPlaka, o.musteriAd, o.satisci]
+      .some(v => v?.toLowerCase().includes(s))) return false;
+    if (filterRol !== "Tümü" && o.rol !== filterRol) return false;
+    if (filterDurum !== "Tümü" && o.opDurum !== filterDurum) return false;
+    if (filterTahsilat !== "Tümü" && o.tahsilatDurum !== filterTahsilat) return false;
+    return true;
+  }).sort((a, b) => {
+    if (sortBy === "tarih_desc") return new Date(b.tarih) - new Date(a.tarih);
+    if (sortBy === "tarih_asc") return new Date(a.tarih) - new Date(b.tarih);
+    if (sortBy === "ref") return a.refKodu.localeCompare(b.refKodu, "tr");
+    if (sortBy === "tutar_desc") return Number(b.maliyetTutar || 0) - Number(a.maliyetTutar || 0);
+    return 0;
+  });
+
+  // ── STATS ──────────────────────────────────────────
+  const stats = {
+    toplam: ops.length,
+    aktif: ops.filter(o => o.opDurum === "Aktif").length,
+    tamamlandi: ops.filter(o => o.opDurum === "Tamamlandı").length,
+    bekleyen: ops.filter(o => o.tahsilatDurum === "Bekliyor" || o.tahsilatDurum === "Kısmi").length,
+    geciken: ops.filter(o => {
+      if (o.tahsilatDurum === "Ödendi") return false;
+      return o.tahsilatVade && o.tahsilatVade < today();
+    }).length,
+    odendi: ops.filter(o => o.tahsilatDurum === "Ödendi").length,
+  };
+
+  const detailOp = ops.find(o => o.id === selectedId);
+
+  // ── SPINNER CSS ──────────────────────────────────
+  useEffect(() => {
+    const id = "eyser-spin-style";
+    if (!document.getElementById(id)) {
+      const s = document.createElement("style");
+      s.id = id;
+      s.textContent = `@keyframes spin{to{transform:rotate(360deg)}} @keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}`;
+      document.head.appendChild(s);
+    }
+  }, []);
+
+  if (loading) return (
+    <div style={S.center}>
+      <div style={S.spinner} />
+      <p style={{ color: "#9ca3af", marginTop: 16, fontFamily: "Inter,sans-serif" }}>Yükleniyor…</p>
+    </div>
+  );
+
+  return (
+    <div style={S.root}>
+      {/* SIDEBAR */}
+      <Sidebar page={page} onNav={p => { setPage(p); setSelectedId(null); }} onNew={goNew} />
+
+      {/* MAIN */}
+      <div style={S.main}>
+        <Topbar page={page} editOp={editOp} detailOp={detailOp} ops={ops} />
+        <div style={S.content}>
+          {page === "dashboard" && <Dashboard stats={stats} ops={ops} onOpen={goDetail} onNew={goNew} />}
+          {page === "satisci" && <SatisciRaporu ops={ops} onOpen={goDetail} />}
+          {page === "list" && (
+            <OpList
+              ops={filtered} search={search} setSearch={setSearch}
+              filterRol={filterRol} setFilterRol={setFilterRol}
+              filterDurum={filterDurum} setFilterDurum={setFilterDurum}
+              filterTahsilat={filterTahsilat} setFilterTahsilat={setFilterTahsilat}
+              sortBy={sortBy} setSortBy={setSortBy}
+              onOpen={goDetail} onEdit={goEdit} onDelete={deleteOp}
+              onToggleDurum={toggleOpDurum} onNew={goNew}
+            />
+          )}
+          {page === "form" && editOp && (
+            <OpForm op={editOp} setOp={setEditOp}
+              onSave={saveOp} onCancel={goList}
+              tab={formTab} setTab={setFormTab}
+              showToast={showToast}
+            />
+          )}
+          {page === "detail" && detailOp && (
+            <OpDetail op={detailOp}
+              onEdit={() => goEdit(detailOp)}
+              onDelete={() => deleteOp(detailOp.id)}
+              onBack={goList}
+              onToggleDurum={d => toggleOpDurum(detailOp.id, d)}
+              tab={detailTab} setTab={setDetailTab}
+              showToast={showToast}
+            />
+          )}
+        </div>
+      </div>
+
+      {/* TOAST */}
+      {toast && (
+        <div style={{ ...S.toast, background: toast.type === "error" ? "#ef4444" : "#22c55e", animation: "fadeIn .2s ease" }}>
+          {toast.type === "error" ? "⚠️" : "✓"} {toast.msg}
+        </div>
+      )}
+
+      {/* SİLME ONAY MODALI */}
+      {confirmModal && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.5)", zIndex: 99999, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+          <div style={{ background: "#fff", borderRadius: 14, padding: 28, maxWidth: 400, width: "100%", boxShadow: "0 8px 32px rgba(0,0,0,.2)" }}>
+            <div style={{ fontSize: 36, textAlign: "center", marginBottom: 12 }}>🗑️</div>
+            <div style={{ fontSize: 16, fontWeight: 800, color: "#111827", textAlign: "center", marginBottom: 8 }}>
+              Operasyonu Sil
+            </div>
+            <div style={{ fontSize: 14, color: "#6b7280", textAlign: "center", marginBottom: 24 }}>
+              <strong style={{ color: "#f59e0b" }}>{confirmModal.refKodu}</strong> operasyonunu ve tüm evraklarını silmek istediğinizden emin misiniz?
+              <div style={{ marginTop: 8, fontSize: 12, color: "#ef4444" }}>Bu işlem geri alınamaz.</div>
+            </div>
+            <div style={{ display: "flex", gap: 10 }}>
+              <button
+                style={{ flex: 1, padding: "11px", background: "#ef4444", border: "none", borderRadius: 8, color: "#fff", fontWeight: 700, fontSize: 14, cursor: "pointer" }}
+                onClick={() => doDelete(confirmModal.opId)}>
+                Evet, Sil
+              </button>
+              <button
+                style={{ flex: 1, padding: "11px", background: "none", border: "1px solid #d1d5db", borderRadius: 8, color: "#374151", fontWeight: 600, fontSize: 14, cursor: "pointer" }}
+                onClick={() => setConfirmModal(null)}>
+                İptal
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════
+// SIDEBAR
+// ═══════════════════════════════════════════════════════
+function Sidebar({ page, onNav, onNew }) {
+  const [hov, setHov] = useState(null);
+  const nav = [
+    { id: "dashboard", icon: "▦", label: "Dashboard" },
+    { id: "list", icon: "☰", label: "Operasyonlar" },
+    { id: "satisci", icon: "👤", label: "Satışçı Raporu" },
+  ];
+  return (
+    <aside style={S.sidebar}>
+      <div style={S.logo}>
+        <svg width="34" height="34" viewBox="0 0 100 110" fill="none">
+          <ellipse cx="52" cy="52" rx="42" ry="46" fill="#f59e0b"/>
+          <path d="M36 18 Q18 50 30 82" stroke="white" strokeWidth="8" fill="none" strokeLinecap="round"/>
+          <path d="M50 12 Q28 50 42 88" stroke="white" strokeWidth="6.5" fill="none" strokeLinecap="round"/>
+        </svg>
+        <div>
+          <div style={S.logoT}>EYSER</div>
+          <div style={S.logoS}>LOJİSTİK</div>
+        </div>
+      </div>
+      <nav style={{ flex: 1, paddingTop: 12 }}>
+        {nav.map(n => {
+          const active = page === n.id || (n.id === "list" && (page === "detail" || page === "form"));
+          return (
+            <button key={n.id}
+              style={{ ...S.navBtn, ...(active ? S.navActive : {}), ...(hov === n.id && !active ? { background: "#2d3748", color: "#e5e7eb" } : {}) }}
+              onMouseEnter={() => setHov(n.id)} onMouseLeave={() => setHov(null)}
+              onClick={() => onNav(n.id)}>
+              <span style={{ fontSize: 17 }}>{n.icon}</span>
+              <span>{n.label}</span>
+            </button>
+          );
+        })}
+      </nav>
+      <div style={{ padding: "0 14px 20px" }}>
+        <button style={S.newBtn} onClick={onNew}>＋ Yeni Operasyon</button>
+      </div>
+    </aside>
+  );
+}
+
+// ═══════════════════════════════════════════════════════
+// TOPBAR
+// ═══════════════════════════════════════════════════════
+function Topbar({ page, editOp, detailOp, ops }) {
+  const crumb = {
+    dashboard: "Dashboard",
+    list: `Operasyonlar (${ops.length})`,
+    form: editOp ? (ops.find(o => o.id === editOp?.id) ? `Düzenle — ${editOp.refKodu || "…"}` : "Yeni Operasyon") : "",
+    detail: detailOp ? `${detailOp.refKodu}` : "",
+  }[page] || "";
+
+  return (
+    <header style={S.topbar}>
+      <div style={{ fontSize: 17, fontWeight: 700, color: "#111827" }}>{crumb}</div>
+      <div style={{ fontSize: 12, color: "#9ca3af" }}>
+        {new Date().toLocaleDateString("tr-TR", { weekday: "short", day: "numeric", month: "long", year: "numeric" })}
+      </div>
+    </header>
+  );
+}
+
+
+// ═══════════════════════════════════════════════════════
+// SATIŞÇI RAPORU
+// ═══════════════════════════════════════════════════════
+function SatisciRaporu({ ops, onOpen }) {
+  const [secili, setSecili] = useState("Tümü");
+  const [tip, setTip] = useState("Tümü"); // Tümü | Forwarder | Özmal
+
+  // Tüm satışçıları çıkar
+  const satiscilar = ["Tümü", ...Array.from(new Set(ops.map(o => o.satisci).filter(Boolean))).sort((a,b) => a.localeCompare(b,"tr"))];
+
+  const filtered = ops.filter(o => {
+    if (secili !== "Tümü" && o.satisci !== secili) return false;
+    if (tip === "Forwarder" && o.rol !== "Forwarder") return false;
+    if (tip === "Özmal" && o.tasimaci !== "Özmal") return false;
+    return true;
+  });
+
+  // İstatistikler
+  const forwarderOps = filtered.filter(o => o.rol === "Forwarder");
+  const ozmalOps = filtered.filter(o => o.tasimaci === "Özmal");
+  const toplamKar = forwarderOps.reduce((acc, o) => {
+    const k = Number(o.musteriNavlun || o.satisTutar || 0) - Number(o.altNavlun || 0);
+    return acc + k;
+  }, 0);
+
+  return (
+    <div>
+      {/* TOOLBAR */}
+      <div style={{ display: "flex", gap: 12, marginBottom: 22, flexWrap: "wrap", alignItems: "center" }}>
+        <div style={{ fontSize: 16, fontWeight: 800, color: "#111827", flex: 1 }}>👤 Satışçı Raporu</div>
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <label style={{ fontSize: 12, color: "#6b7280", fontWeight: 600 }}>Satışçı:</label>
+          <Sel value={secili} onChange={setSecili} opts={satiscilar} />
+          <label style={{ fontSize: 12, color: "#6b7280", fontWeight: 600 }}>Tip:</label>
+          <Sel value={tip} onChange={setTip} opts={["Tümü", "Forwarder", "Özmal"]} />
+        </div>
+      </div>
+
+      {/* ÖZET KARTLAR */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(160px,1fr))", gap: 14, marginBottom: 22 }}>
+        <div style={{ background: "#fff", borderRadius: 10, padding: "14px 18px", boxShadow: "0 1px 3px rgba(0,0,0,.05)", borderTop: "3px solid #f59e0b" }}>
+          <div style={{ fontSize: 24 }}>📋</div>
+          <div style={{ fontSize: 26, fontWeight: 900, color: "#f59e0b", lineHeight: 1.1, marginTop: 4 }}>{filtered.length}</div>
+          <div style={{ fontSize: 11, color: "#6b7280", marginTop: 3 }}>Toplam Operasyon</div>
+        </div>
+        <div style={{ background: "#fff", borderRadius: 10, padding: "14px 18px", boxShadow: "0 1px 3px rgba(0,0,0,.05)", borderTop: "3px solid #3b82f6" }}>
+          <div style={{ fontSize: 24 }}>🔄</div>
+          <div style={{ fontSize: 26, fontWeight: 900, color: "#3b82f6", lineHeight: 1.1, marginTop: 4 }}>{forwarderOps.length}</div>
+          <div style={{ fontSize: 11, color: "#6b7280", marginTop: 3 }}>Forwarder</div>
+        </div>
+        <div style={{ background: "#fff", borderRadius: 10, padding: "14px 18px", boxShadow: "0 1px 3px rgba(0,0,0,.05)", borderTop: "3px solid #8b5cf6" }}>
+          <div style={{ fontSize: 24 }}>🚛</div>
+          <div style={{ fontSize: 26, fontWeight: 900, color: "#8b5cf6", lineHeight: 1.1, marginTop: 4 }}>{ozmalOps.length}</div>
+          <div style={{ fontSize: 11, color: "#6b7280", marginTop: 3 }}>Özmal Taşıma</div>
+        </div>
+        <div style={{ background: "#fff", borderRadius: 10, padding: "14px 18px", boxShadow: "0 1px 3px rgba(0,0,0,.05)", borderTop: `3px solid ${toplamKar >= 0 ? "#22c55e" : "#ef4444"}` }}>
+          <div style={{ fontSize: 24 }}>{toplamKar >= 0 ? "💰" : "📉"}</div>
+          <div style={{ fontSize: 22, fontWeight: 900, color: toplamKar >= 0 ? "#22c55e" : "#ef4444", lineHeight: 1.1, marginTop: 4 }}>{toplamKar >= 0 ? "+" : ""}{fmt(toplamKar, "EUR")}</div>
+          <div style={{ fontSize: 11, color: "#6b7280", marginTop: 3 }}>Forwarder Kar</div>
+        </div>
+      </div>
+
+      {/* SATIŞÇI BAŞLIKLARI — eğer "Tümü" seçiliyse her satışçı ayrı */}
+      {secili === "Tümü" && satiscilar.filter(s => s !== "Tümü").length === 0 && (
+        <div style={S.emptyState}>
+          <div style={{ fontSize: 48 }}>👤</div>
+          <div style={{ fontWeight: 700, color: "#374151", marginTop: 10 }}>Henüz satışçı atanmış operasyon yok</div>
+          <div style={{ color: "#9ca3af", fontSize: 13, marginTop: 6 }}>Operasyon formundaki "İşi Alan Satışçı" alanını doldurun.</div>
+        </div>
+      )}
+
+      {/* OPERASYON LİSTESİ */}
+      {filtered.length > 0 && (
+        <div style={{ background: "#fff", borderRadius: 12, boxShadow: "0 1px 4px rgba(0,0,0,.07)", overflow: "hidden" }}>
+          <table style={S.table}>
+            <thead>
+              <tr>
+                {["Satışçı", "Ref", "Tarih", "Müşteri", "Güzergah", "Rol", "Aldım", "Verdim", "Kar", "Tahsilat", "Durum"].map(h => (
+                  <th key={h} style={S.th}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map(op => {
+                const isF = op.rol === "Forwarder";
+                const aldim = Number(op.musteriNavlun || op.satisTutar || 0);
+                const verdim = Number(op.altNavlun || 0);
+                const kar = isF && (aldim || verdim) ? aldim - verdim : null;
+                const doviz = op.musteriNavlunDoviz || op.satisDoviz || "EUR";
+                return (
+                  <tr key={op.id} style={{ ...S.tr, cursor: "pointer" }} onClick={() => onOpen(op)}>
+                    <td style={{ ...S.td, fontWeight: 700, color: "#f59e0b" }}>{op.satisci || <span style={{ color: "#d1d5db" }}>—</span>}</td>
+                    <td style={{ ...S.td, fontWeight: 600 }}>{op.refKodu}</td>
+                    <td style={S.td}>{op.tarih}</td>
+                    <td style={{ ...S.td, maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{op.musteriAd || op.yukGonderici || "—"}</td>
+                    <td style={{ ...S.td, maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{op.guzergah || "—"}</td>
+                    <td style={S.td}><RolBadge rol={op.rol} /></td>
+                    <td style={{ ...S.td, color: "#16a34a", fontWeight: 600 }}>{isF ? fmt(aldim, doviz) : fmt(op.maliyetTutar, op.maliyetDoviz)}</td>
+                    <td style={{ ...S.td, color: "#dc2626" }}>{isF ? fmt(verdim, op.altNavlunDoviz || "EUR") : <span style={{ color: "#d1d5db" }}>—</span>}</td>
+                    <td style={{ ...S.td, fontWeight: 700, color: kar === null ? "#d1d5db" : kar >= 0 ? "#22c55e" : "#ef4444" }}>
+                      {kar === null ? "—" : `${kar >= 0 ? "+" : ""}${fmt(Math.abs(kar), doviz)}`}
+                    </td>
+                    <td style={S.td}><TahsilatBadge durum={op.tahsilatDurum} vade={op.tahsilatVade} /></td>
+                    <td style={S.td}><OpDurumBadge durum={op.opDurum} /></td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+          <div style={{ padding: "10px 14px", fontSize: 12, color: "#9ca3af", borderTop: "1px solid #f3f4f6" }}>
+            {filtered.length} operasyon gösteriliyor
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════
+// DASHBOARD
+// ═══════════════════════════════════════════════════════
+function Dashboard({ stats, ops, onOpen, onNew }) {
+  const urgent = ops.filter(o => o.tahsilatDurum !== "Ödendi" && o.tahsilatVade && o.tahsilatVade < today()).sort((a, b) => a.tahsilatVade.localeCompare(b.tahsilatVade));
+  const recent = [...ops].sort((a, b) => new Date(b.olusturmaTarih) - new Date(a.olusturmaTarih)).slice(0, 6);
+
+  const statCards = [
+    { label: "Toplam", val: stats.toplam, color: "#f59e0b", icon: "🚛" },
+    { label: "Aktif", val: stats.aktif, color: "#3b82f6", icon: "🔵" },
+    { label: "Tamamlandı", val: stats.tamamlandi, color: "#22c55e", icon: "✅" },
+    { label: "Bekleyen Tahsilat", val: stats.bekleyen, color: "#f59e0b", icon: "⏳" },
+    { label: "Geciken Tahsilat", val: stats.geciken, color: "#ef4444", icon: "🔴" },
+    { label: "Tahsil Edildi", val: stats.odendi, color: "#22c55e", icon: "💰" },
+  ];
+
+  return (
+    <div>
+      <div style={S.statGrid}>
+        {statCards.map(c => (
+          <div key={c.label} style={{ ...S.statCard, borderTop: `3px solid ${c.color}` }}>
+            <div style={{ fontSize: 26 }}>{c.icon}</div>
+            <div style={{ fontSize: 30, fontWeight: 900, color: c.color, lineHeight: 1.1 }}>{c.val}</div>
+            <div style={{ fontSize: 11, color: "#6b7280", marginTop: 3 }}>{c.label}</div>
+          </div>
+        ))}
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20, marginTop: 20 }}>
+        <Card title="Son Operasyonlar">
+          {recent.length === 0 ? <Empty msg="Henüz operasyon yok." action={onNew} actionLabel="Yeni ekle →" /> :
+            recent.map(op => (
+              <Row key={op.id} onClick={() => onOpen(op)}>
+                <div>
+                  <div style={{ fontWeight: 700, color: "#111827", fontSize: 13 }}>{op.refKodu}</div>
+                  <div style={{ fontSize: 11, color: "#9ca3af" }}>{op.guzergah || "—"} · {op.rol}</div>
+                </div>
+                <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                  <OpDurumBadge durum={op.opDurum} />
+                  <TahsilatBadge durum={op.tahsilatDurum} />
+                </div>
+              </Row>
+            ))
+          }
+        </Card>
+        <Card title="⚠️ Geciken Tahsilatlar">
+          {urgent.length === 0 ? <div style={{ color: "#9ca3af", fontSize: 13, paddingTop: 12 }}>Geciken tahsilat yok 🎉</div> :
+            urgent.map(op => {
+              const d = diffDays(op.tahsilatVade);
+              return (
+                <Row key={op.id} onClick={() => onOpen(op)} style={{ borderLeft: "3px solid #ef4444" }}>
+                  <div>
+                    <div style={{ fontWeight: 700, color: "#111827", fontSize: 13 }}>{op.refKodu}</div>
+                    <div style={{ fontSize: 11, color: "#9ca3af" }}>{op.yukGonderici || "—"}</div>
+                  </div>
+                  <div style={{ fontSize: 11, color: "#ef4444", fontWeight: 700 }}>
+                    {Math.abs(d)} gün gecikti
+                  </div>
+                </Row>
+              );
+            })
+          }
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════
+// OP LIST
+// ═══════════════════════════════════════════════════════
+function OpList({ ops, search, setSearch, filterRol, setFilterRol, filterDurum, setFilterDurum, filterTahsilat, setFilterTahsilat, sortBy, setSortBy, onOpen, onEdit, onDelete, onToggleDurum, onNew }) {
+  const [hovRow, setHovRow] = useState(null);
+
+  return (
+    <div>
+      {/* TOOLBAR */}
+      <div style={{ display: "flex", gap: 10, marginBottom: 18, flexWrap: "wrap", alignItems: "center" }}>
+        <input style={{ ...S.input, flex: "1 1 200px", minWidth: 160 }} placeholder="🔍 Ref, gönderici, güzergah, plaka…"
+          value={search} onChange={e => setSearch(e.target.value)} />
+        <Sel value={filterDurum} onChange={setFilterDurum} opts={["Tümü", ...OP_DURUMLAR]} />
+        <Sel value={filterRol} onChange={setFilterRol} opts={["Tümü", ...ROLLER]} />
+        <Sel value={filterTahsilat} onChange={setFilterTahsilat} opts={["Tümü", ...TAHSILAT_DURUMLAR]} />
+        <Sel value={sortBy} onChange={setSortBy} opts={[
+          { val: "tarih_desc", label: "↓ Tarih" },
+          { val: "tarih_asc", label: "↑ Tarih" },
+          { val: "ref", label: "Ref A-Z" },
+          { val: "tutar_desc", label: "↓ Tutar" },
+        ]} />
+        <button style={S.primaryBtn} onClick={onNew}>＋ Yeni</button>
+      </div>
+
+      {ops.length === 0 ? (
+        <div style={S.emptyState}>
+          <div style={{ fontSize: 56 }}>🚛</div>
+          <div style={{ fontWeight: 700, color: "#374151", marginTop: 10 }}>Operasyon bulunamadı</div>
+          <div style={{ color: "#9ca3af", fontSize: 13, marginTop: 6 }}>Filtreleri değiştirin veya yeni operasyon ekleyin.</div>
+          <button style={{ ...S.primaryBtn, marginTop: 14 }} onClick={onNew}>＋ Yeni Operasyon</button>
+        </div>
+      ) : (
+        <div style={{ overflowX: "auto", borderRadius: 12, boxShadow: "0 1px 4px rgba(0,0,0,.07)" }}>
+          <table style={S.table}>
+            <thead>
+              <tr>{["Ref", "Tarih", "Durum", "Güzergah", "Gönderici / İşveren", "Rol", "Taşımacı", "Aldım", "Verdim", "Kar/Zarar", "Tahsilat", "İşlem"].map(h => (
+                <th key={h} style={S.th}>{h}</th>
+              ))}</tr>
+            </thead>
+            <tbody>
+              {ops.map(op => {
+                // Forwarder: aldım=satisTutar, verdim=altNavlun, kar=aldım-verdim
+                // Taşıyıcı: aldım=satisTutar(yoksa maliyetTutar), verdim=—
+                const isForwarder = op.rol === "Forwarder";
+                const aldim = isForwarder
+                  ? { t: op.musteriNavlun || op.satisTutar, d: op.musteriNavlunDoviz || op.satisDoviz || "EUR" }
+                  : { t: op.maliyetTutar, d: op.maliyetDoviz };
+                const verdim = isForwarder
+                  ? { t: op.altNavlun, d: op.altNavlunDoviz || "EUR" }
+                  : null;
+                const kar = isForwarder && aldim.t && verdim?.t
+                  ? Number(aldim.t) - Number(verdim.t) : null;
+                const gondericiLabel = op.musteriAd || op.yukGonderici || "—";
+                const isHov = hovRow === op.id;
+                return (
+                  <tr key={op.id}
+                    style={{ ...S.tr, background: isHov ? "#fffbeb" : op.opDurum === "İptal" ? "#f9fafb" : "white", opacity: op.opDurum === "İptal" ? 0.6 : 1 }}
+                    onMouseEnter={() => setHovRow(op.id)} onMouseLeave={() => setHovRow(null)}
+                    onClick={() => onOpen(op)}>
+                    <td style={{ ...S.td, fontWeight: 700, color: "#f59e0b" }}>{op.refKodu}</td>
+                    <td style={S.td}>{op.tarih}</td>
+                    <td style={S.td}><OpDurumBadge durum={op.opDurum} /></td>
+                    <td style={{ ...S.td, maxWidth: 130, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{op.guzergah || "—"}</td>
+                    <td style={{ ...S.td, maxWidth: 130, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      <div style={{ fontWeight: 600 }}>{gondericiLabel}</div>
+                      {isForwarder && op.isverenTipi && <div style={{ fontSize: 10, color: "#9ca3af" }}>{op.isverenTipi}</div>}
+                    </td>
+                    <td style={S.td}><RolBadge rol={op.rol} /></td>
+                    <td style={S.td}>{op.tasimaci === "Alt Nakliyeci" ? `Alt: ${op.altNakliyeciAd || "?"}` : "Özmal"}</td>
+                    <td style={{ ...S.td, fontWeight: 600, color: "#16a34a" }}>{fmt(aldim.t, aldim.d)}</td>
+                    <td style={{ ...S.td, color: "#dc2626" }}>{verdim ? fmt(verdim.t, verdim.d) : <span style={{ color: "#d1d5db" }}>—</span>}</td>
+                    <td style={{ ...S.td, fontWeight: 700, color: kar === null ? "#d1d5db" : kar >= 0 ? "#22c55e" : "#ef4444" }}>
+                      {kar === null ? "—" : `${kar >= 0 ? "+" : ""}${fmt(Math.abs(kar), aldim.d)}`}
+                    </td>
+                    <td style={S.td}><TahsilatBadge durum={op.tahsilatDurum} vade={op.tahsilatVade} /></td>
+                    <td style={S.td} onClick={e => e.stopPropagation()}>
+                      <div style={{ display: "flex", gap: 4 }}>
+                        <IBtn title="Düzenle" onClick={() => onEdit(op)}>✏️</IBtn>
+                        {op.opDurum === "Aktif" && <IBtn title="Tamamlandı İşaretle" onClick={() => onToggleDurum(op.id, "Tamamlandı")}>☑️</IBtn>}
+                        {op.opDurum !== "Aktif" && <IBtn title="Aktif Yap" onClick={() => onToggleDurum(op.id, "Aktif")}>🔄</IBtn>}
+                        <IBtn title="Sil" style={{ color: "#ef4444" }} onClick={() => onDelete(op.id)}>🗑️</IBtn>
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+      <div style={{ fontSize: 12, color: "#9ca3af", marginTop: 10 }}>{ops.length} operasyon gösteriliyor</div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════
+// OP FORM
+// ═══════════════════════════════════════════════════════
+function OpForm({ op, setOp, onSave, onCancel, tab, setTab, showToast }) {
+  const evrakRef = useRef();
+  const faturaRef = useRef();
+  const [uploading, setUploading] = useState(false);
+
+  function set(f, v) { setOp(p => ({ ...p, [f]: v })); }
+
+  async function handleUpload(e, type) {
+    const files = Array.from(e.target.files);
+    if (!files.length) return;
+    setUploading(true);
+    const errors = [];
+    const metas = [];
+
+    for (const file of files) {
+      try {
+        const b64 = await readFileAsBase64(file);
+        const meta = {
+          id: uid(),
+          name: file.name,
+          type: file.type,
+          size: file.size,
+          kategori: type === "evrak" ? "Diğer" : undefined,
+          yuklenmeTarih: new Date().toISOString(),
+        };
+        const ok = await saveFile(op.id, { ...meta, data: b64 });
+        if (ok) metas.push(meta);
+        else errors.push(`"${file.name}" kaydedilemedi`);
+      } catch (err) {
+        errors.push(err.message);
+      }
+    }
+
+    if (metas.length) {
+      setOp(p => ({
+        ...p,
+        [type === "evrak" ? "evraklar" : "faturalar"]: [
+          ...(type === "evrak" ? p.evraklar : p.faturalar),
+          ...metas,
+        ],
+      }));
+      showToast(`${metas.length} dosya yüklendi ✓`);
+    }
+    if (errors.length) showToast(errors.join(" | "), "error");
+    setUploading(false);
+    e.target.value = "";
+  }
+
+  async function removeFile(id, type) {
+    await deleteFile(op.id, id);
+    setOp(p => ({
+      ...p,
+      [type === "evrak" ? "evraklar" : "faturalar"]:
+        (type === "evrak" ? p.evraklar : p.faturalar).filter(f => f.id !== id),
+    }));
+  }
+
+  function updateEvrakKategori(id, kategori) {
+    setOp(p => ({ ...p, evraklar: p.evraklar.map(e => e.id === id ? { ...e, kategori } : e) }));
+  }
+
+  const tabs = [
+    { id: "bilgi", label: "📋 Temel" },
+    { id: "mali", label: "💰 Mali" },
+    { id: "evrak", label: `📎 Evraklar (${(op.evraklar||[]).length})` },
+    { id: "fatura", label: `🧾 Faturalar (${(op.faturalar||[]).length})` },
+  ];
+
+  return (
+    <div style={S.card}>
+      <Tabs tabs={tabs} active={tab} setActive={setTab} />
+
+      {tab === "bilgi" && (
+        <div style={S.grid2}>
+          <FF label="Referans Kodu *" span={1}><input style={S.input} value={op.refKodu} onChange={e => set("refKodu", e.target.value)} placeholder="EYS-2024-001" /></FF>
+          <FF label="Tarih" span={1}><input type="date" style={S.input} value={op.tarih} onChange={e => set("tarih", e.target.value)} /></FF>
+          <FF label="Operasyon Durumu" span={1}>
+            <select style={S.sel} value={op.opDurum} onChange={e => set("opDurum", e.target.value)}>
+              {OP_DURUMLAR.map(d => <option key={d}>{d}</option>)}
+            </select>
+          </FF>
+          <FF label="Rol" span={1}>
+            <select style={S.sel} value={op.rol} onChange={e => set("rol", e.target.value)}>
+              {ROLLER.map(r => <option key={r}>{r}</option>)}
+            </select>
+          </FF>
+          {/* Taşımacı tipi - sadece Taşıyıcı rolünde göster; Forwarder'da mali sekmesinden yönetilir */}
+          {op.rol === "Taşıyıcı" && (
+            <FF label="Taşımacı" span={1}>
+              <select style={S.sel} value={op.tasimaci} onChange={e => set("tasimaci", e.target.value)}>
+                {TASIMACILAR.map(t => <option key={t}>{t}</option>)}
+              </select>
+            </FF>
+          )}
+          {op.rol === "Taşıyıcı" && op.tasimaci === "Alt Nakliyeci" && (
+            <FF label="Alt Nakliyeci Adı" span={1}><input style={S.input} value={op.altNakliyeciAd || ""} onChange={e => set("altNakliyeciAd", e.target.value)} placeholder="Firma adı" /></FF>
+          )}
+          {op.rol === "Forwarder" && (
+            <div style={{ gridColumn: "span 1", background: "#eff6ff", border: "1px solid #bfdbfe", borderRadius: 8, padding: "10px 14px", fontSize: 12, color: "#1d4ed8" }}>
+              <strong>💡 Forwarder Modu:</strong> Alt nakliyeci bilgilerini ve ücretleri <strong>Mali</strong> sekmesinden girebilirsiniz.
+            </div>
+          )}
+
+          {/* ── SATIŞ BİLGİLERİ ── */}
+          <div style={{ gridColumn: "span 2", borderTop: "1px solid #f3f4f6", paddingTop: 14, marginTop: 4 }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: "#9ca3af", textTransform: "uppercase", letterSpacing: 0.8, marginBottom: 14 }}>👤 Satış Bilgileri</div>
+            <div style={S.grid2}>
+              <FF label="İşi Alan Satışçı" span={1}>
+                <input style={{ ...S.input, borderColor: "#f59e0b" }} value={op.satisci || ""} onChange={e => set("satisci", e.target.value)} placeholder="Örn: İbrahim, Ahmet…" />
+              </FF>
+              <FF label="Müşteri Firma Adı" span={1}>
+                <input style={S.input} value={op.musteriAd || op.yukGonderici || ""} onChange={e => { set("musteriAd", e.target.value); set("yukGonderici", e.target.value); }} placeholder="Örn: Dachser, XYZ A.Ş." />
+              </FF>
+            </div>
+          </div>
+
+          {/* ── TAŞIMA BİLGİLERİ ── */}
+          <div style={{ gridColumn: "span 2", borderTop: "1px solid #f3f4f6", paddingTop: 14 }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: "#9ca3af", textTransform: "uppercase", letterSpacing: 0.8, marginBottom: 14 }}>🚛 Taşıma Bilgileri</div>
+            <div style={S.grid2}>
+              <FF label="Gönderici" span={1}><input style={S.input} value={op.musteriAd || op.yukGonderici || ""} onChange={e => { set("musteriAd", e.target.value); set("yukGonderici", e.target.value); }} placeholder="Yükü veren firma" /></FF>
+              <FF label="Alıcı" span={1}><input style={S.input} value={op.yukAlici || ""} onChange={e => set("yukAlici", e.target.value)} placeholder="Alıcı firma" /></FF>
+              <FF label="Güzergah" span={2}><input style={S.input} value={op.guzergah || ""} onChange={e => set("guzergah", e.target.value)} placeholder="İstanbul → Ankara" /></FF>
+              <FF label="Araç Plakası" span={1}><input style={S.input} value={op.aracPlaka || ""} onChange={e => set("aracPlaka", e.target.value)} placeholder="34 ABC 123" /></FF>
+              <FF label="Sürücü" span={1}><input style={S.input} value={op.surucu || ""} onChange={e => set("surucu", e.target.value)} placeholder="Ad Soyad" /></FF>
+              <FF label="Yük Tanımı" span={2}><input style={S.input} value={op.yukTanimi || ""} onChange={e => set("yukTanimi", e.target.value)} placeholder="Tekstil, makine, gıda…" /></FF>
+            </div>
+          </div>
+
+          <FF label="Notlar" span={2}><textarea style={{ ...S.input, height: 76, resize: "vertical" }} value={op.notlar || ""} onChange={e => set("notlar", e.target.value)} placeholder="Operasyona dair notlar…" /></FF>
+        </div>
+      )}
+
+      {tab === "mali" && (
+        <div>
+
+          {/* ══════════════════════════════════════
+              FORWARDER MALİ BLOĞU
+              Rol = Forwarder seçilince görünür
+          ══════════════════════════════════════ */}
+          {op.rol === "Forwarder" && (
+            <div>
+
+              {/* ── BLOK 1: Müşteriden Alıyorum ── */}
+              <div style={{ background: "#f0fdf4", border: "2px solid #86efac", borderRadius: 12, padding: 20, marginBottom: 16 }}>
+                <div style={{ fontSize: 14, fontWeight: 800, color: "#15803d", marginBottom: 16 }}>
+                  📥 Müşteriden Alacağım Navlun
+                  {(op.musteriAd || op.yukGonderici) && (
+                    <span style={{ fontSize: 12, fontWeight: 600, color: "#6b7280", marginLeft: 8 }}>
+                      ({op.musteriAd || op.yukGonderici})
+                    </span>
+                  )}
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 100px", gap: 12, marginBottom: 14 }}>
+                  <FF label="Navlun Tutarı">
+                    <input
+                      type="number"
+                      style={{ ...S.input, fontSize: 18, fontWeight: 700, color: "#15803d" }}
+                      value={op.musteriNavlun || ""}
+                      onChange={e => set("musteriNavlun", e.target.value)}
+                      placeholder="2500"
+                    />
+                  </FF>
+                  <FF label="Döviz">
+                    <select style={S.sel} value={op.musteriNavlunDoviz || "EUR"} onChange={e => set("musteriNavlunDoviz", e.target.value)}>
+                      {CURRENCIES.map(c => <option key={c}>{c}</option>)}
+                    </select>
+                  </FF>
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
+                  <FF label="Tahsilat Durumu">
+                    <select style={S.sel} value={op.tahsilatDurum || "Bekliyor"} onChange={e => set("tahsilatDurum", e.target.value)}>
+                      {TAHSILAT_DURUMLAR.map(s => <option key={s}>{s}</option>)}
+                    </select>
+                  </FF>
+                  <FF label="Vade Tarihi">
+                    <input type="date" style={S.input} value={op.tahsilatVade || ""} onChange={e => set("tahsilatVade", e.target.value)} />
+                  </FF>
+                  <FF label="Tahsilat Tarihi">
+                    <input type="date" style={S.input} value={op.tahsilatTarih || ""} onChange={e => set("tahsilatTarih", e.target.value)} />
+                  </FF>
+                </div>
+              </div>
+
+              {/* ── BLOK 2: Alt Nakliyeye Veriyorum ── */}
+              <div style={{ background: "#fef2f2", border: "2px solid #fca5a5", borderRadius: 12, padding: 20, marginBottom: 16 }}>
+                <div style={{ fontSize: 14, fontWeight: 800, color: "#dc2626", marginBottom: 16 }}>
+                  📤 Alt Nakliyeye Vereceğim Ücret
+                </div>
+                {/* Alt nakliyeci adı buraya taşındı — forwarder rolünde her zaman görünür */}
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 14 }}>
+                  <FF label="Alt Nakliyeci Firma Adı">
+                    <input
+                      style={S.input}
+                      value={op.altNakliyeciAd || ""}
+                      onChange={e => { set("altNakliyeciAd", e.target.value); set("tasimaci", "Alt Nakliyeci"); }}
+                      placeholder="Firma adı (örn: ABC Taşımacılık)"
+                    />
+                  </FF>
+                  <div /> {/* boşluk */}
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 100px", gap: 12, marginBottom: 14 }}>
+                  <FF label="Ödeyeceğim Navlun Tutarı">
+                    <input
+                      type="number"
+                      style={{ ...S.input, fontSize: 18, fontWeight: 700, color: "#dc2626" }}
+                      value={op.altNavlun || ""}
+                      onChange={e => set("altNavlun", e.target.value)}
+                      placeholder="2400"
+                    />
+                  </FF>
+                  <FF label="Döviz">
+                    <select style={S.sel} value={op.altNavlunDoviz || "EUR"} onChange={e => set("altNavlunDoviz", e.target.value)}>
+                      {CURRENCIES.map(c => <option key={c}>{c}</option>)}
+                    </select>
+                  </FF>
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
+                  <FF label="Ödeme Durumu">
+                    <select style={S.sel} value={op.odemeDurum || "Bekliyor"} onChange={e => set("odemeDurum", e.target.value)}>
+                      {TAHSILAT_DURUMLAR.map(s => <option key={s}>{s}</option>)}
+                    </select>
+                  </FF>
+                  <FF label="Vade Tarihi">
+                    <input type="date" style={S.input} value={op.odemeVade || ""} onChange={e => set("odemeVade", e.target.value)} />
+                  </FF>
+                  <FF label="Ödeme Tarihi">
+                    <input type="date" style={S.input} value={op.odemeTarih || ""} onChange={e => set("odemeTarih", e.target.value)} />
+                  </FF>
+                </div>
+              </div>
+
+              {/* ── BLOK 3: Kar Özeti — ikisi girilince otomatik hesaplar ── */}
+              {(op.musteriNavlun || op.altNavlun) && (() => {
+                const aldim  = Number(op.musteriNavlun || 0);
+                const verdim = Number(op.altNavlun || 0);
+                const kar    = aldim - verdim;
+                const pct    = aldim > 0 ? ((kar / aldim) * 100).toFixed(1) : "—";
+                const doviz  = op.musteriNavlunDoviz || "EUR";
+                return (
+                  <div style={{ border: `2px solid ${kar >= 0 ? "#22c55e" : "#ef4444"}`, borderRadius: 12, padding: 20, background: kar >= 0 ? "#f0fdf4" : "#fef2f2" }}>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: "#6b7280", marginBottom: 16, textTransform: "uppercase", letterSpacing: 0.5 }}>
+                      {kar >= 0 ? "✅ Kar Özeti" : "❌ Zarar Durumu"}
+                    </div>
+                    <div style={{ display: "flex", gap: 0, borderRadius: 10, overflow: "hidden", border: "1px solid #e5e7eb" }}>
+                      {/* Aldım */}
+                      <div style={{ flex: 1, padding: "16px 20px", background: "#fff", textAlign: "center", borderRight: "1px solid #e5e7eb" }}>
+                        <div style={{ fontSize: 11, color: "#9ca3af", fontWeight: 700, textTransform: "uppercase", marginBottom: 6 }}>Müşteriden Aldım</div>
+                        <div style={{ fontSize: 22, fontWeight: 900, color: "#15803d" }}>{fmt(aldim, doviz)}</div>
+                        {op.musteriAd && <div style={{ fontSize: 11, color: "#9ca3af", marginTop: 4 }}>{op.musteriAd}</div>}
+                      </div>
+                      {/* Ok */}
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", padding: "0 12px", background: "#f9fafb", fontSize: 20, color: "#9ca3af" }}>−</div>
+                      {/* Verdim */}
+                      <div style={{ flex: 1, padding: "16px 20px", background: "#fff", textAlign: "center", borderLeft: "1px solid #e5e7eb", borderRight: "1px solid #e5e7eb" }}>
+                        <div style={{ fontSize: 11, color: "#9ca3af", fontWeight: 700, textTransform: "uppercase", marginBottom: 6 }}>Alt Nakliyeye Verdim</div>
+                        <div style={{ fontSize: 22, fontWeight: 900, color: "#dc2626" }}>{fmt(verdim, op.altNavlunDoviz || doviz)}</div>
+                        {op.altNakliyeciAd && <div style={{ fontSize: 11, color: "#9ca3af", marginTop: 4 }}>{op.altNakliyeciAd}</div>}
+                      </div>
+                      {/* Ok */}
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", padding: "0 12px", background: "#f9fafb", fontSize: 20, color: "#9ca3af" }}>=</div>
+                      {/* Kar */}
+                      <div style={{ flex: 1, padding: "16px 20px", background: kar >= 0 ? "#f0fdf4" : "#fef2f2", textAlign: "center" }}>
+                        <div style={{ fontSize: 11, color: "#9ca3af", fontWeight: 700, textTransform: "uppercase", marginBottom: 6 }}>{kar >= 0 ? "Net Kar" : "Net Zarar"}</div>
+                        <div style={{ fontSize: 22, fontWeight: 900, color: kar >= 0 ? "#16a34a" : "#dc2626" }}>
+                          {kar >= 0 ? "+" : ""}{fmt(kar, doviz)}
+                        </div>
+                        <div style={{ fontSize: 11, color: "#9ca3af", marginTop: 4 }}>Marj: {pct}%</div>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* Ek gider */}
+              <div style={{ marginTop: 16, padding: "14px 16px", background: "#fffbeb", border: "1px solid #fde68a", borderRadius: 10 }}>
+                <div style={{ fontSize: 12, fontWeight: 700, color: "#92400e", marginBottom: 10 }}>➕ Ek Gider (Opsiyonel — akaryakıt, hamaliye vb.)</div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 100px", gap: 10 }}>
+                  <FF label="Tutar">
+                    <input type="number" style={S.input} value={op.maliyetTutar || ""} onChange={e => set("maliyetTutar", e.target.value)} placeholder="0.00" />
+                  </FF>
+                  <FF label="Döviz">
+                    <select style={S.sel} value={op.maliyetDoviz || "TL"} onChange={e => set("maliyetDoviz", e.target.value)}>
+                      {CURRENCIES.map(c => <option key={c}>{c}</option>)}
+                    </select>
+                  </FF>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ══════════════════════════════════════
+              TAŞIYICI / ÖZMAL MALİ BLOĞU
+          ══════════════════════════════════════ */}
+          {op.rol === "Taşıyıcı" && (
+            <div>
+              <div style={{ background: "#f8fafc", border: "1px solid #e2e8f0", borderRadius: 12, padding: 20, marginBottom: 16 }}>
+                <div style={{ fontSize: 14, fontWeight: 800, color: "#374151", marginBottom: 16 }}>💸 Navlun / Ücret</div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 100px", gap: 12, marginBottom: 16 }}>
+                  <FF label="Tutar">
+                    <input type="number" style={{ ...S.input, fontSize: 18, fontWeight: 700 }} value={op.maliyetTutar || ""} onChange={e => set("maliyetTutar", e.target.value)} placeholder="0.00" />
+                  </FF>
+                  <FF label="Döviz">
+                    <select style={S.sel} value={op.maliyetDoviz || "TL"} onChange={e => set("maliyetDoviz", e.target.value)}>
+                      {CURRENCIES.map(c => <option key={c}>{c}</option>)}
+                    </select>
+                  </FF>
+                </div>
+                <div style={{ fontSize: 13, fontWeight: 700, color: "#6b7280", marginBottom: 10 }}>📥 Tahsilat</div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
+                  <FF label="Durum">
+                    <select style={S.sel} value={op.tahsilatDurum || "Bekliyor"} onChange={e => set("tahsilatDurum", e.target.value)}>
+                      {TAHSILAT_DURUMLAR.map(s => <option key={s}>{s}</option>)}
+                    </select>
+                  </FF>
+                  <FF label="Vade Tarihi">
+                    <input type="date" style={S.input} value={op.tahsilatVade || ""} onChange={e => set("tahsilatVade", e.target.value)} />
+                  </FF>
+                  <FF label="Tahsilat Tarihi">
+                    <input type="date" style={S.input} value={op.tahsilatTarih || ""} onChange={e => set("tahsilatTarih", e.target.value)} />
+                  </FF>
+                </div>
+              </div>
+            </div>
+          )}
+
+        </div>
+      )}
+
+                        {tab === "evrak" && (
+        <FileUploadSection
+          files={op.evraklar} type="evrak"
+          inputRef={evrakRef} uploading={uploading}
+          onUpload={e => handleUpload(e, "evrak")}
+          onRemove={id => removeFile(id, "evrak")}
+          onKategori={updateEvrakKategori}
+          opId={op.id}
+        />
+      )}
+
+      {tab === "fatura" && (
+        <FileUploadSection
+          files={op.faturalar} type="fatura"
+          inputRef={faturaRef} uploading={uploading}
+          onUpload={e => handleUpload(e, "fatura")}
+          onRemove={id => removeFile(id, "fatura")}
+          opId={op.id}
+        />
+      )}
+
+      <div style={{ display: "flex", gap: 10, marginTop: 26, paddingTop: 18, borderTop: "1px solid #e5e7eb" }}>
+        <button style={S.primaryBtn} onClick={onSave}>💾 Kaydet</button>
+        <button style={S.ghostBtn} onClick={onCancel}>İptal</button>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════
+// FILE UPLOAD SECTION
+// ═══════════════════════════════════════════════════════
+function FileUploadSection({ files, type, inputRef, uploading, onUpload, onRemove, onKategori, opId }) {
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16 }}>
+        <input ref={inputRef} type="file" multiple accept="image/*,.pdf" style={{ display: "none" }} onChange={onUpload} />
+        <button style={{ ...S.primaryBtn, opacity: uploading ? 0.6 : 1 }} disabled={uploading} onClick={() => inputRef.current.click()}>
+          {uploading ? "⏳ Yükleniyor…" : `📎 ${type === "evrak" ? "Evrak" : "Fatura"} Yükle`}
+        </button>
+        <span style={{ fontSize: 12, color: "#9ca3af" }}>PDF veya görsel · Maks. {MAX_FILE_MB}MB/dosya · {files.length} yüklü</span>
+      </div>
+      {files.length === 0 ? (
+        <div style={S.emptyState}>
+          <div style={{ fontSize: 44 }}>{type === "evrak" ? "📂" : "🧾"}</div>
+          <div style={{ color: "#9ca3af", marginTop: 6, fontSize: 13 }}>Henüz dosya yüklenmedi</div>
+        </div>
+      ) : (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(190px,1fr))", gap: 12 }}>
+          {files.map(f => (
+            <FileCard key={f.id} file={f} opId={opId} onRemove={() => onRemove(f.id)}
+              onKategori={type === "evrak" ? k => onKategori(f.id, k) : null} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════
+// FILE CARD — lazy load from storage
+// ═══════════════════════════════════════════════════════
+function FileCard({ file, opId, onRemove, onKategori, readOnly }) {
+  const [data, setData] = useState(null);
+  const [preview, setPreview] = useState(false);
+  const isImg = file.type?.startsWith("image/");
+  const isPdf = file.type === "application/pdf";
+
+  async function load() {
+    if (data) { setPreview(true); return; }
+    const d = await loadFileData(opId, file.id);
+    if (d) { setData(d); setPreview(true); }
+  }
+
+  return (
+    <>
+      <div style={{ background: "#f9fafb", border: "1px solid #e5e7eb", borderRadius: 10, overflow: "hidden" }}>
+        <div style={{ height: 90, background: isImg ? "#f3f4f6" : isPdf ? "#fee2e2" : "#f3f4f6", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", fontSize: 34 }}
+          onClick={load}>
+          {isImg ? "🖼️" : isPdf ? "📄" : "📎"}
+        </div>
+        <div style={{ padding: "8px 10px" }}>
+          <div style={{ fontSize: 11, fontWeight: 600, color: "#374151", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={file.name}>{file.name}</div>
+          <div style={{ fontSize: 10, color: "#9ca3af", marginTop: 2 }}>{(file.size / 1024).toFixed(0)} KB · {new Date(file.yuklenmeTarih).toLocaleDateString("tr-TR")}</div>
+          {onKategori && (
+            <select style={{ ...S.sel, fontSize: 10, padding: "3px 6px", marginTop: 5, width: "100%" }}
+              value={file.kategori || "Diğer"}
+              onChange={e => onKategori(e.target.value)}>
+              {EVRAK_KATEGORILER.map(k => <option key={k}>{k}</option>)}
+            </select>
+          )}
+          {file.kategori && readOnly && <div style={{ fontSize: 10, color: "#3b82f6", marginTop: 3 }}>{file.kategori}</div>}
+          <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+            <button style={{ ...S.iBtn, fontSize: 11 }} onClick={load}>🔍 Görüntüle</button>
+            {!readOnly && <button style={{ ...S.iBtn, fontSize: 11, color: "#ef4444" }} onClick={onRemove}>🗑️ Kaldır</button>}
+          </div>
+        </div>
+      </div>
+
+      {/* INLINE PREVIEW MODAL */}
+      {preview && data && (
+        <div style={S.modal} onClick={() => setPreview(false)}>
+          <div style={S.modalBox} onClick={e => e.stopPropagation()}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+              <div style={{ fontWeight: 700, color: "#111827", fontSize: 14 }}>{file.name}</div>
+              <button style={S.iBtn} onClick={() => setPreview(false)}>✕</button>
+            </div>
+            {isPdf
+              ? <iframe src={data} style={{ width: "100%", height: 520, border: "none", borderRadius: 8 }} title={file.name} />
+              : <img src={data} alt={file.name} style={{ maxWidth: "100%", maxHeight: 520, borderRadius: 8, objectFit: "contain", display: "block", margin: "0 auto" }} />
+            }
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+// ═══════════════════════════════════════════════════════
+// OP DETAIL
+// ═══════════════════════════════════════════════════════
+function OpDetail({ op, onEdit, onDelete, onBack, onToggleDurum, tab, setTab, showToast }) {
+  // Forwarder: kar = müşteri navlunu - alt nakliye ücreti
+  const kar = op.rol === "Forwarder" && (op.musteriNavlun || op.satisTutar) && op.altNavlun
+    ? Number(op.musteriNavlun || op.satisTutar || 0) - Number(op.altNavlun) : null;
+  const vadeGun = diffDays(op.tahsilatVade);
+
+  const tabs = [
+    { id: "bilgi", label: "📋 Bilgiler" },
+    { id: "mali", label: "💰 Mali" },
+    { id: "evrak", label: `📎 Evraklar (${(op.evraklar||[]).length})` },
+    { id: "fatura", label: `🧾 Faturalar (${(op.faturalar||[]).length})` },
+  ];
+
+  return (
+    <div>
+      {/* HEADER */}
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 18, flexWrap: "wrap" }}>
+        <button style={S.ghostBtn} onClick={onBack}>← Geri</button>
+        <h2 style={{ fontSize: 20, fontWeight: 900, color: "#111827", margin: 0, flex: 1 }}>{op.refKodu}</h2>
+        <OpDurumBadge durum={op.opDurum} large />
+        <TahsilatBadge durum={op.tahsilatDurum} vade={op.tahsilatVade} />
+        {/* Hızlı durum değiştirme */}
+        {op.opDurum === "Aktif" && <button style={S.successBtn} onClick={() => onToggleDurum("Tamamlandı")}>☑️ Tamamlandı</button>}
+        {op.opDurum === "Tamamlandı" && <button style={{ ...S.ghostBtn, fontSize: 13 }} onClick={() => onToggleDurum("Aktif")}>🔄 Aktife Al</button>}
+        {op.opDurum !== "İptal" && <button style={{ ...S.ghostBtn, fontSize: 13 }} onClick={() => onToggleDurum("İptal")}>🚫 İptal</button>}
+        <button style={S.primaryBtn} onClick={onEdit}>✏️ Düzenle</button>
+        <button style={{ ...S.ghostBtn, color: "#ef4444", borderColor: "#fca5a5" }} onClick={onDelete}>🗑️</button>
+      </div>
+
+      {/* VADE UYARISI */}
+      {op.tahsilatDurum !== "Ödendi" && op.tahsilatVade && vadeGun !== null && vadeGun <= 7 && (
+        <div style={{ background: vadeGun < 0 ? "#fef2f2" : "#fffbeb", border: `1px solid ${vadeGun < 0 ? "#fca5a5" : "#fcd34d"}`, borderRadius: 8, padding: "10px 14px", marginBottom: 16, fontSize: 13, fontWeight: 600, color: vadeGun < 0 ? "#dc2626" : "#d97706" }}>
+          {vadeGun < 0 ? `⚠️ Tahsilat ${Math.abs(vadeGun)} gün gecikti!` : vadeGun === 0 ? "⚠️ Tahsilat vadesi bugün!" : `⏰ Tahsilat vadesi ${vadeGun} gün sonra`}
+        </div>
+      )}
+
+      <div style={S.card}>
+        <Tabs tabs={tabs} active={tab} setActive={setTab} />
+
+        {tab === "bilgi" && (
+          <div style={S.detailGrid}>
+            {[
+              ["Ref Kodu", op.refKodu],
+              ["Tarih", op.tarih],
+              ["İşi Alan Satışçı", op.satisci || "—"],
+              ["Müşteri", op.musteriAd || op.yukGonderici || "—"],
+              ["Güzergah", op.guzergah || "—"],
+              ["Yük Tanımı", op.yukTanimi || "—"],
+              ["Gönderici", op.musteriAd || op.yukGonderici || "—"],
+              ["Alıcı", op.yukAlici || "—"],
+              ["Araç Plakası", op.aracPlaka || "—"],
+              ["Sürücü", op.surucu || "—"],
+              ["Rol", op.rol],
+              ["Taşımacı", op.tasimaci + (op.altNakliyeciAd ? ` — ${op.altNakliyeciAd}` : "")],
+              ["Güncelleme", new Date(op.guncellemeTarih || op.olusturmaTarih || Date.now()).toLocaleString("tr-TR")],
+            ].map(([k, v]) => (
+              <div key={k} style={S.dRow}>
+                <div style={S.dLabel}>{k}</div>
+                <div style={S.dVal}>{v}</div>
+              </div>
+            ))}
+            {op.notlar && (
+              <div style={{ ...S.dRow, gridColumn: "span 2" }}>
+                <div style={S.dLabel}>Notlar</div>
+                <div style={{ ...S.dVal, whiteSpace: "pre-wrap" }}>{op.notlar}</div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {tab === "mali" && (
+          <div>
+            {/* Forwarder: İş zinciri özeti */}
+            {op.rol === "Forwarder" && (
+              <div style={{ background: "#f8fafc", border: "1px solid #e5e7eb", borderRadius: 12, padding: "16px 18px", marginBottom: 20 }}>
+                <div style={{ fontSize: 12, fontWeight: 700, color: "#6b7280", marginBottom: 12, textTransform: "uppercase", letterSpacing: 0.5 }}>İş Zinciri</div>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                  <div style={{ background: "#fffbeb", border: "1px solid #fcd34d", borderRadius: 8, padding: "10px 16px", textAlign: "center" }}>
+                    <div style={{ fontSize: 10, color: "#9ca3af", marginBottom: 2 }}>{op.isverenTipi || "İşveren"}</div>
+                    <div style={{ fontWeight: 700, color: "#111827" }}>{op.isveren || op.yukGonderici || "—"}</div>
+                  </div>
+                  <div style={{ fontSize: 20, color: "#9ca3af" }}>→</div>
+                  <div style={{ background: "#eff6ff", border: "1px solid #bfdbfe", borderRadius: 8, padding: "10px 16px", textAlign: "center" }}>
+                    <div style={{ fontSize: 10, color: "#9ca3af", marginBottom: 2 }}>BEN (Eyser)</div>
+                    <div style={{ fontWeight: 700, color: "#3b82f6" }}>Forwarder</div>
+                  </div>
+                  <div style={{ fontSize: 20, color: "#9ca3af" }}>→</div>
+                  <div style={{ background: "#fef2f2", border: "1px solid #fecaca", borderRadius: 8, padding: "10px 16px", textAlign: "center" }}>
+                    <div style={{ fontSize: 10, color: "#9ca3af", marginBottom: 2 }}>Alt Nakliyeci</div>
+                    <div style={{ fontWeight: 700, color: "#111827" }}>{op.altNakliyeciAd || "—"}</div>
+                  </div>
+                </div>
+              </div>
+            )}
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(190px,1fr))", gap: 14, marginBottom: 22 }}>
+              {op.rol === "Forwarder" ? <>
+                <MCard title="Müşteri Navlunu" val={fmt(op.musteriNavlun || op.satisTutar, op.musteriNavlunDoviz || op.satisDoviz || "EUR")} color="#16a34a" icon="📥" />
+                <MCard title="Alt Nakliye Ücreti" val={fmt(op.altNavlun, op.altNavlunDoviz || "EUR")} color="#dc2626" icon="📤" />
+                {kar !== null && <MCard title={kar >= 0 ? "Net Kar" : "Net Zarar"} val={fmt(Math.abs(kar), op.musteriNavlunDoviz || op.satisDoviz || "EUR")} color={kar >= 0 ? "#22c55e" : "#ef4444"} icon={kar >= 0 ? "✅" : "❌"} />}
+                {op.maliyetTutar && <MCard title="Ek Gider" val={fmt(op.maliyetTutar, op.maliyetDoviz)} color="#f59e0b" icon="➕" />}
+              </> : <>
+                <MCard title="Navlun / Maliyet" val={fmt(op.maliyetTutar, op.maliyetDoviz)} color="#ef4444" icon="💸" />
+              </>}
+            </div>
+            <div style={S.detailGrid}>
+              {/* Forwarder: müşteri tahsilat + alt nakliye ödeme */}
+            {op.rol === "Forwarder" ? (<>
+              <div style={{ gridColumn: "span 2" }}>
+                <div style={{ fontSize: 11, fontWeight: 700, color: "#15803d", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 10 }}>📥 Müşteri Tahsilatı</div>
+                <div style={S.detailGrid}>
+                  {[
+                    ["Müşteri Navlunu", fmt(op.musteriNavlun || op.satisTutar, op.musteriNavlunDoviz || op.satisDoviz || "EUR")],
+                    ["Tahsilat Durumu", <TahsilatBadge key="t" durum={op.tahsilatDurum} vade={op.tahsilatVade} />],
+                    ["Vade Tarihi", op.tahsilatVade || "—"],
+                    ["Tahsilat Tarihi", op.tahsilatTarih || "—"],
+                  ].map(([k, v], i) => (
+                    <div key={i} style={S.dRow}>
+                      <div style={S.dLabel}>{k}</div>
+                      <div style={S.dVal}>{v}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div style={{ gridColumn: "span 2" }}>
+                <div style={{ fontSize: 11, fontWeight: 700, color: "#dc2626", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 10 }}>📤 Alt Nakliye Ödemesi</div>
+                <div style={S.detailGrid}>
+                  {[
+                    ["Alt Nakliye Ücreti", fmt(op.altNavlun, op.altNavlunDoviz || "EUR")],
+                    ["Ödeme Durumu", <TahsilatBadge key="o" durum={op.odemeDurum} />],
+                    ["Vade Tarihi", op.odemeVade || "—"],
+                    ["Ödeme Tarihi", op.odemeTarih || "—"],
+                  ].map(([k, v], i) => (
+                    <div key={i} style={S.dRow}>
+                      <div style={S.dLabel}>{k}</div>
+                      <div style={S.dVal}>{v}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </>) : (
+              <>{[
+                ["Navlun", fmt(op.maliyetTutar, op.maliyetDoviz)],
+                ["Tahsilat Durumu", <TahsilatBadge key="t" durum={op.tahsilatDurum} vade={op.tahsilatVade} />],
+                ["Vade Tarihi", op.tahsilatVade || "—"],
+                ["Tahsilat Tarihi", op.tahsilatTarih || "—"],
+              ].map(([k, v], i) => (
+                <div key={i} style={S.dRow}>
+                  <div style={S.dLabel}>{k}</div>
+                  <div style={S.dVal}>{v}</div>
+                </div>
+              ))}</>
+            )}
+            </div>
+          </div>
+        )}
+
+        {tab === "evrak" && (
+          <div>
+            {(op.evraklar||[]).length === 0 ? <div style={S.emptyState}><div style={{ fontSize: 44 }}>📂</div><div style={{ color: "#9ca3af", marginTop: 6, fontSize: 13 }}>Evrak yüklenmemiş</div></div> : (
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(190px,1fr))", gap: 12 }}>
+                {(op.evraklar||[]).map(f => <FileCard key={f.id} file={f} opId={op.id} readOnly />)}
+              </div>
+            )}
+          </div>
+        )}
+
+        {tab === "fatura" && (
+          <div>
+            {(op.faturalar||[]).length === 0 ? <div style={S.emptyState}><div style={{ fontSize: 44 }}>🧾</div><div style={{ color: "#9ca3af", marginTop: 6, fontSize: 13 }}>Fatura yüklenmemiş</div></div> : (
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(190px,1fr))", gap: 12 }}>
+                {(op.faturalar||[]).map(f => <FileCard key={f.id} file={f} opId={op.id} readOnly />)}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════
+// MICRO COMPONENTS
+// ═══════════════════════════════════════════════════════
+function OpDurumBadge({ durum, large }) {
+  const c = OP_DURUM_COLORS[durum] || "#6b7280";
+  return <span style={{ background: c + "18", color: c, border: `1px solid ${c}44`, borderRadius: 20, padding: large ? "4px 14px" : "2px 10px", fontSize: large ? 13 : 11, fontWeight: 700 }}>{durum}</span>;
+}
+function TahsilatBadge({ durum, vade }) {
+  const c = TAHSILAT_COLORS[durum] || "#6b7280";
+  const gecikti = durum !== "Ödendi" && vade && vade < today();
+  const col = gecikti ? "#ef4444" : c;
+  return <span style={{ background: col + "18", color: col, border: `1px solid ${col}44`, borderRadius: 20, padding: "2px 10px", fontSize: 11, fontWeight: 700, whiteSpace: "nowrap" }}>{gecikti ? "⚠️ " : ""}{durum}</span>;
+}
+function RolBadge({ rol }) {
+  const c = rol === "Forwarder" ? "#3b82f6" : "#8b5cf6";
+  return <span style={{ background: c + "18", color: c, border: `1px solid ${c}44`, borderRadius: 20, padding: "2px 10px", fontSize: 11, fontWeight: 700 }}>{rol}</span>;
+}
+function Tabs({ tabs, active, setActive }) {
+  return (
+    <div style={{ display: "flex", gap: 2, marginBottom: 22, borderBottom: "1px solid #e5e7eb", flexWrap: "wrap" }}>
+      {tabs.map(t => (
+        <button key={t.id} style={{ ...S.tab, ...(active === t.id ? S.tabOn : {}) }} onClick={() => setActive(t.id)}>{t.label}</button>
+      ))}
+    </div>
+  );
+}
+function FF({ label, children, span = 1 }) {
+  return <div style={{ gridColumn: `span ${span}` }}><label style={S.label}>{label}</label>{children}</div>;
+}
+function SectionTitle({ children, span = 2 }) {
+  return <div style={{ gridColumn: `span ${span}`, fontSize: 11, fontWeight: 700, color: "#9ca3af", textTransform: "uppercase", letterSpacing: 0.8, borderBottom: "1px solid #f3f4f6", paddingBottom: 6, marginTop: 4 }}>{children}</div>;
+}
+function Sel({ value, onChange, opts }) {
+  return (
+    <select style={S.sel} value={value} onChange={e => onChange(e.target.value)}>
+      {opts.map(o => typeof o === "string" ? <option key={o} value={o}>{o}</option> : <option key={o.val} value={o.val}>{o.label}</option>)}
+    </select>
+  );
+}
+function IBtn({ children, onClick, title, style: st }) {
+  return <button style={{ ...S.iBtn, ...st }} onClick={onClick} title={title}>{children}</button>;
+}
+function Card({ title, children }) {
+  return <div style={S.card}><div style={{ fontSize: 14, fontWeight: 700, color: "#374151", marginBottom: 12 }}>{title}</div>{children}</div>;
+}
+function Row({ children, onClick, style: st }) {
+  const [hov, setHov] = useState(false);
+  return <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "9px 10px", borderRadius: 8, cursor: "pointer", marginBottom: 4, background: hov ? "#fffbeb" : "transparent", transition: "background .1s", ...st }} onMouseEnter={() => setHov(true)} onMouseLeave={() => setHov(false)} onClick={onClick}>{children}</div>;
+}
+function Empty({ msg, action, actionLabel }) {
+  return <div style={{ color: "#9ca3af", fontSize: 13, paddingTop: 12 }}>{msg} {action && <button style={{ background: "none", border: "none", color: "#f59e0b", cursor: "pointer", fontWeight: 600 }} onClick={action}>{actionLabel}</button>}</div>;
+}
+function MCard({ title, val, color, icon }) {
+  return <div style={{ background: color + "0f", border: `1px solid ${color}2a`, borderRadius: 10, padding: 14 }}><div style={{ fontSize: 22 }}>{icon}</div><div style={{ fontSize: 10, color: "#9ca3af", marginTop: 3 }}>{title}</div><div style={{ fontSize: 20, fontWeight: 900, color, marginTop: 2 }}>{val}</div></div>;
+}
+
+// ═══════════════════════════════════════════════════════
+// STYLES
+// ═══════════════════════════════════════════════════════
+const S = {
+  root: { display: "flex", height: "100vh", fontFamily: "'Inter','Segoe UI',system-ui,sans-serif", background: "#f3f4f6", overflow: "hidden", fontSize: 14 },
+  center: { display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100vh", background: "#f3f4f6" },
+  spinner: { width: 36, height: 36, border: "4px solid #e5e7eb", borderTop: "4px solid #f59e0b", borderRadius: "50%", animation: "spin 1s linear infinite" },
+  sidebar: { width: 210, background: "#111827", display: "flex", flexDirection: "column", flexShrink: 0 },
+  logo: { display: "flex", alignItems: "center", gap: 10, padding: "22px 18px 20px", borderBottom: "1px solid #1f2937" },
+  logoT: { fontSize: 18, fontWeight: 900, color: "#f59e0b", letterSpacing: 3 },
+  logoS: { fontSize: 9, color: "#6b7280", letterSpacing: 3, marginTop: -1 },
+  navBtn: { width: "100%", display: "flex", alignItems: "center", gap: 10, padding: "11px 18px", background: "none", border: "none", color: "#6b7280", fontSize: 13, fontWeight: 600, cursor: "pointer", textAlign: "left", transition: "all .12s" },
+  navActive: { background: "#1f2937", color: "#f59e0b", borderLeft: "3px solid #f59e0b", paddingLeft: 15 },
+  newBtn: { width: "100%", padding: "11px", background: "#f59e0b", border: "none", color: "#111827", fontWeight: 800, fontSize: 13, cursor: "pointer", letterSpacing: 0.3 },
+  main: { flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" },
+  topbar: { background: "#fff", borderBottom: "1px solid #e5e7eb", padding: "14px 24px", display: "flex", justifyContent: "space-between", alignItems: "center", flexShrink: 0 },
+  content: { flex: 1, overflowY: "auto", padding: 24 },
+  statGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(150px,1fr))", gap: 14 },
+  statCard: { background: "#fff", borderRadius: 10, padding: "16px 18px", display: "flex", flexDirection: "column", gap: 3, boxShadow: "0 1px 3px rgba(0,0,0,.05)" },
+  card: { background: "#fff", borderRadius: 12, padding: 22, boxShadow: "0 1px 3px rgba(0,0,0,.06)", marginBottom: 0 },
+  table: { width: "100%", borderCollapse: "collapse", background: "#fff", fontSize: 12 },
+  th: { padding: "10px 12px", background: "#f9fafb", color: "#6b7280", fontWeight: 700, fontSize: 10, textAlign: "left", borderBottom: "2px solid #e5e7eb", whiteSpace: "nowrap", textTransform: "uppercase", letterSpacing: 0.5 },
+  td: { padding: "10px 12px", borderBottom: "1px solid #f3f4f6", color: "#374151", verticalAlign: "middle" },
+  tr: { cursor: "pointer", transition: "background .1s" },
+  emptyState: { textAlign: "center", padding: "44px 0", color: "#9ca3af" },
+  grid2: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 },
+  detailGrid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 },
+  dRow: { background: "#f9fafb", borderRadius: 8, padding: "9px 13px" },
+  dLabel: { fontSize: 10, color: "#9ca3af", fontWeight: 700, marginBottom: 3, textTransform: "uppercase", letterSpacing: 0.4 },
+  dVal: { fontSize: 13, color: "#111827", fontWeight: 500 },
+  tabs: { display: "flex", gap: 2, marginBottom: 22, borderBottom: "1px solid #e5e7eb", flexWrap: "wrap" },
+  tab: { padding: "9px 14px", background: "none", border: "none", borderBottom: "2px solid transparent", cursor: "pointer", fontSize: 12, fontWeight: 600, color: "#6b7280", marginBottom: -1 },
+  tabOn: { color: "#f59e0b", borderBottomColor: "#f59e0b" },
+  input: { width: "100%", padding: "8px 11px", border: "1px solid #d1d5db", borderRadius: 7, fontSize: 13, color: "#111827", background: "#fff", boxSizing: "border-box", outline: "none" },
+  sel: { padding: "8px 10px", border: "1px solid #d1d5db", borderRadius: 7, fontSize: 13, color: "#111827", background: "#fff", outline: "none", cursor: "pointer" },
+  label: { display: "block", fontSize: 11, fontWeight: 600, color: "#374151", marginBottom: 5 },
+  primaryBtn: { padding: "9px 18px", background: "#f59e0b", border: "none", borderRadius: 7, color: "#111827", fontWeight: 700, fontSize: 13, cursor: "pointer", whiteSpace: "nowrap" },
+  successBtn: { padding: "9px 18px", background: "#22c55e", border: "none", borderRadius: 7, color: "#fff", fontWeight: 700, fontSize: 13, cursor: "pointer", whiteSpace: "nowrap" },
+  ghostBtn: { padding: "9px 18px", background: "none", border: "1px solid #d1d5db", borderRadius: 7, color: "#374151", fontWeight: 600, fontSize: 13, cursor: "pointer", whiteSpace: "nowrap" },
+  iBtn: { background: "none", border: "none", cursor: "pointer", fontSize: 15, padding: "3px 5px", borderRadius: 5 },
+  toast: { position: "fixed", bottom: 24, right: 24, padding: "12px 20px", borderRadius: 9, color: "#fff", fontWeight: 700, fontSize: 13, zIndex: 9999, boxShadow: "0 4px 20px rgba(0,0,0,.2)" },
+  modal: { position: "fixed", inset: 0, background: "rgba(0,0,0,.65)", zIndex: 10000, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 },
+  modalBox: { background: "#fff", borderRadius: 14, padding: 22, width: "100%", maxWidth: 720, maxHeight: "90vh", overflowY: "auto" },
+};
